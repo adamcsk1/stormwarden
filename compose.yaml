@@ -1,0 +1,22 @@
+services:
+  internet-analyzer:
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      APP_PASSWORD: ${APP_PASSWORD:?set APP_PASSWORD in .env}
+      PIHOLE_DNS_ADDR: ${PIHOLE_DNS_ADDR:?set PIHOLE_DNS_ADDR in .env}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Budapest}
+      APP_COOKIE_SECURE: ${APP_COOKIE_SECURE:-false}
+      APP_LISTEN_ADDR: ${APP_LISTEN_ADDR:-:8080}
+      HTTP_EXPECTED_STATUS: ${HTTP_EXPECTED_STATUS:-204}
+    volumes:
+      - analyzer-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  analyzer-data:

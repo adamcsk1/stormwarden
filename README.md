@@ -1,0 +1,80 @@
+# Internet Analyzer
+
+Dockerized Go service for recording intermittent DNS and internet performance problems. It compares Pi-hole TCP DNS with public DNS, measures TCP connectivity and HTTP phases, records incidents, and provides password-protected HTMX reports.
+
+## Measurements
+
+- Pi-hole and public DNS-over-TCP response time and failures
+- Independent TCP internet connectivity
+- HTTP DNS, connect, TLS, time-to-first-byte, total duration, and status
+- Optional bounded transfer-speed test
+- Correlated warning, error, and critical incidents
+
+Probe traffic profiles are selectable in UI:
+
+| Profile | Transfer probe | Estimated traffic |
+| --- | --- | --- |
+| Minimal | Disabled | Very low |
+| Low | 256 KiB every 15 minutes | About 0.75 GB/month |
+| Detailed | 5 MiB every 15 minutes | About 15 GB/month |
+
+## Run
+
+Linux host networking is recommended so container sees same network path as house infrastructure.
+
+```sh
+cp .env.example .env
+# Edit APP_PASSWORD and PIHOLE_DNS_ADDR.
+docker compose up -d --build
+```
+
+Open `http://HOST-IP:8080`.
+
+For HTTPS behind reverse proxy, set `APP_COOKIE_SECURE=true`. Do not expose plain HTTP UI directly to internet.
+
+## Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `APP_PASSWORD` | required | UI password |
+| `PIHOLE_DNS_ADDR` | `127.0.0.1:53` | Direct Pi-hole TCP DNS endpoint |
+| `PUBLIC_DNS_ADDR` | `1.1.1.1:53` | Control DNS endpoint |
+| `HTTP_PROBE_URL` | Google 204 endpoint | Small HTTP timing target |
+| `HTTP_EXPECTED_STATUS` | `204` | Required probe response; use `0` for any 2xx/3xx |
+| `TRANSFER_PROBE_URL` | Cloudflare speed endpoint | Bounded transfer target |
+| `APP_TIMEZONE` | `Europe/Budapest` | Display timezone |
+| `APP_COOKIE_SECURE` | `false` | Require HTTPS session cookies |
+| `APP_LISTEN_ADDR` | `:8080` | HTTP listen address; Docker health check follows its port |
+| `DATA_PATH` | `/data/internet-analyzer.db` | SQLite location in image |
+| `EXPORT_DIR` | `/data/exports` | Generated reports |
+
+## AI Reports
+
+Dashboard generates last-day or last-week ZIP reports. Each report contains:
+
+- `summary.md`: concise interpretation and aggregate counts
+- `measurements.jsonl`: raw machine-readable probes
+- `incidents.jsonl`: correlated problem log
+- `settings-redacted.json`: diagnostic configuration without secrets
+- `system-info.json`: runtime context
+
+Generated reports run through one background worker and expire after 7 days. Raw measurements retain 30 days; compact 15-minute, hourly, and daily rollups plus incident history remain available. Reports support day, week, month, custom, and all-history ranges. Cleanup runs daily.
+
+## Development
+
+HTMX is committed as local static asset so UI remains functional during internet outages. Refresh pinned asset after dependency changes:
+
+```sh
+npm install
+npm run vendor
+go test ./...
+go run ./cmd/internet-analyzer
+```
+
+`APP_PASSWORD` must be set for local execution.
+
+## Current Limits
+
+- No modem/router radio metrics yet. Weather or 4G/5G signal causation needs RSRP, RSRQ, SINR, band, and cell data from router API.
+- No ICMP packet-loss or jitter probe yet. Current release diagnoses TCP, DNS, TLS, TTFB, and transfer behavior.
+- In-memory sessions expire on application restart, requiring login again.
