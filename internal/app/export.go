@@ -202,7 +202,11 @@ func (a *App) writeExport(ctx context.Context, zw *zip.Writer, from, to time.Tim
 	assetTargets, _ := parseAssetTargets(assetTargetSetting)
 	redactedAssetTargets := make([]map[string]string, 0, len(assetTargets))
 	for _, target := range assetTargets {
-		redactedAssetTargets = append(redactedAssetTargets, map[string]string{"name": target.Name, "url": redactURL(target.URL)})
+		mode := "fixed"
+		if target.CacheBust {
+			mode = "cache-bust"
+		}
+		redactedAssetTargets = append(redactedAssetTargets, map[string]string{"name": target.Name, "url": redactURL(target.URL), "mode": mode})
 	}
 	availability := 100.0
 	if total > 0 {

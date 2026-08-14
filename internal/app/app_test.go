@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -819,15 +820,99 @@ func TestDNSPathFragmentMarksStaleSamples(t *testing.T) {
 }
 
 func TestParseAssetTargets(t *testing.T) {
-	targets, err := parseAssetTargets("Video|https://example.test/video.jpg\nNews|https://example.test/news.png;Map|http://example.test/map.webp")
-	if err != nil || len(targets) != 3 || targets[2].Name != "Map" {
+	targets, err := parseAssetTargets("Video|https://example.test/video.jpg\nNews|cache-bust|https://example.test/news.png;Map|http://example.test/map.webp")
+	if err != nil || len(targets) != 3 || targets[2].Name != "Map" || !targets[1].CacheBust {
 		t.Fatalf("parsed targets = %+v, err = %v", targets, err)
+	}
+	pipeURL, err := parseAssetTargets("Legacy|https://example.test/path|segment")
+	if err != nil || pipeURL[0].URL != "https://example.test/path|segment" {
+		t.Fatalf("legacy URL containing pipe rejected: %+v, err = %v", pipeURL, err)
 	}
 	if _, err := parseAssetTargets("File|ftp://example.test/file"); err == nil {
 		t.Fatal("non-HTTP asset URL accepted")
 	}
 	if _, err := parseAssetTargets(strings.Repeat("Image|https://example.test/image.jpg\n", maxAssetTargets+1)); err == nil {
 		t.Fatal("too many asset targets accepted")
+	}
+	if assetSampleTarget(targets[0]) == assetSampleTarget(AssetTarget{Name: targets[0].Name, URL: targets[0].URL, CacheBust: true}) {
+		t.Fatal("fixed and cache-busted sample identities collide")
+	}
+}
+
+func TestCacheBustedAssetURLPreservesQuery(t *testing.T) {
+	got := cacheBustedAssetURL("https://example.test/file?bytes=32768", "unique")
+	parsed, err := url.Parse(got)
+	if err != nil || parsed.Query().Get("bytes") != "32768" || parsed.Query().Get("stormwarden") != "unique" {
+		t.Fatalf("cache-busted URL = %q, err = %v", got, err)
+	}
+}
+
+func TestAssetProbeSchedulesCacheBustEveryFiveMinutes(t *testing.T) {
+	var fixed, cacheBusted atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("stormwarden") == "" {
+			fixed.Add(1)
+		} else {
+			cacheBusted.Add(1)
+		}
+		_, _ = w.Write([]byte("asset"))
+	}))
+	defer server.Close()
+	a := newTestApp(t)
+	configured := "Fixed|" + server.URL + "/fixed\nBusted|cache-bust|" + server.URL + "/busted?bytes=32768"
+	if err := setSetting(context.Background(), a.db, "asset_targets", configured); err != nil {
+		t.Fatal(err)
+	}
+	a.nextCacheBustProbe = time.Now().Add(time.Minute)
+	a.runAssetProbeCycle(context.Background())
+	if fixed.Load() != 1 || cacheBusted.Load() != 0 {
+		t.Fatalf("early cycle counts: fixed=%d cache-busted=%d", fixed.Load(), cacheBusted.Load())
+	}
+	a.nextCacheBustProbe = time.Now()
+	a.runAssetProbeCycle(context.Background())
+	if fixed.Load() != 2 || cacheBusted.Load() != 1 {
+		t.Fatalf("due cycle counts: fixed=%d cache-busted=%d", fixed.Load(), cacheBusted.Load())
+	}
+}
+
+func TestAssetDefaultMigrationRunsOnce(t *testing.T) {
+	a := newTestApp(t)
+	_, _ = a.db.Exec(`DELETE FROM settings WHERE key='asset_defaults_v2'`)
+	if err := setSetting(context.Background(), a.db, "asset_targets", legacyDefaultAssetTargets); err != nil {
+		t.Fatal(err)
+	}
+	configured, err := initializeAssetSettings(context.Background(), a.db, defaultAssetTargets)
+	if err != nil || configured != defaultAssetTargets {
+		t.Fatalf("migrated defaults = %q, err = %v", configured, err)
+	}
+	if err := setSetting(context.Background(), a.db, "asset_targets", legacyDefaultAssetTargets); err != nil {
+		t.Fatal(err)
+	}
+	configured, err = initializeAssetSettings(context.Background(), a.db, defaultAssetTargets)
+	if err != nil || configured != legacyDefaultAssetTargets {
+		t.Fatalf("removed default was re-added: %q, err = %v", configured, err)
+	}
+}
+
+func TestFreshLegacyAssetOverrideIsNotMigrated(t *testing.T) {
+	a := newTestApp(t)
+	_, _ = a.db.Exec(`DELETE FROM settings WHERE key IN ('asset_targets', 'asset_defaults_v2')`)
+	configured, err := initializeAssetSettings(context.Background(), a.db, legacyDefaultAssetTargets)
+	if err != nil || configured != legacyDefaultAssetTargets {
+		t.Fatalf("explicit legacy override changed: %q, err = %v", configured, err)
+	}
+}
+
+func TestCacheBustedIncidentRecoversAfterNextObservation(t *testing.T) {
+	a := newTestApp(t)
+	category := assetIncidentCategory(AssetTarget{Name: "Busted", CacheBust: true})
+	failure := Sample{ProbeType: "aggregate", Target: category, Severity: Error, Message: "failed"}
+	a.updateIncident(context.Background(), failure)
+	a.updateIncident(context.Background(), failure)
+	a.updateIncidents(context.Background(), nil, map[string]bool{category: true})
+	incident, err := activeIncident(context.Background(), a.db)
+	if err != nil || incident != nil {
+		t.Fatalf("cache-busted incident did not recover: %+v, err = %v", incident, err)
 	}
 }
 

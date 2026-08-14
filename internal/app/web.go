@@ -343,9 +343,10 @@ func (a *App) dnsPathsFragment(w http.ResponseWriter, r *http.Request) {
 }
 
 type assetPathView struct {
-	Name   string
-	Sample *Sample
-	Stale  bool
+	Name     string
+	Interval string
+	Sample   *Sample
+	Stale    bool
 }
 
 func (a *App) assetsFragment(w http.ResponseWriter, r *http.Request) {
@@ -362,7 +363,11 @@ func (a *App) assetsFragment(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		assets = append(assets, assetPathView{Name: target.Name, Sample: sample, Stale: sample != nil && time.Since(sample.CreatedAt) > 75*time.Second})
+		interval, staleAfter := "every 30s", 75*time.Second
+		if target.CacheBust {
+			interval, staleAfter = "every 5m · cache-busted", 11*time.Minute
+		}
+		assets = append(assets, assetPathView{Name: target.Name, Interval: interval, Sample: sample, Stale: sample != nil && time.Since(sample.CreatedAt) > staleAfter})
 	}
 	a.render(w, "assets.html", map[string]any{"Assets": assets})
 }
@@ -415,7 +420,7 @@ func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) {
 	configured, _ := parseAssetTargets(assetTargets)
 	retained := make(map[string]bool, len(configured))
 	for _, target := range configured {
-		retained[assetIncidentCategory(target.Name)] = true
+		retained[assetIncidentCategory(target)] = true
 	}
 	tx, err := a.db.BeginTx(r.Context(), nil)
 	if err != nil {
@@ -430,7 +435,7 @@ func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	for _, incident := range incidents {
-		if strings.HasPrefix(incident.Category, "asset_path:") && !retained[incident.Category] {
+		if isAssetIncidentCategory(incident.Category) && !retained[incident.Category] {
 			if _, err := tx.ExecContext(r.Context(), `UPDATE incidents SET ended_at=? WHERE id=? AND ended_at IS NULL`, dbTime(time.Now()), incident.ID); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -442,7 +447,7 @@ func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for category := range a.incidentStates {
-		if strings.HasPrefix(category, "asset_path:") && !retained[category] {
+		if isAssetIncidentCategory(category) && !retained[category] {
 			delete(a.incidentStates, category)
 		}
 	}
