@@ -25,10 +25,14 @@ Compose publishes the web interface on port `8080` by default. Set `APP_PORT` in
 ```sh
 cp .env.example .env
 # Edit APP_PASSWORD and PIHOLE_DNS_ADDR.
+mkdir -p data
+sudo chown -R 100:101 data
 docker compose up -d --build
 ```
 
 Open `http://HOST-IP:8080`.
+
+Persistent database and generated reports are stored in the project-local `data/` directory.
 
 For HTTPS behind reverse proxy, set `APP_COOKIE_SECURE=true`. Do not expose plain HTTP UI directly to internet.
 
