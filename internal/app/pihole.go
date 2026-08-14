@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -20,9 +19,21 @@ type piHoleAPIClient struct {
 	baseURL      string
 	password     string
 	httpClient   *http.Client
-	mu           sync.Mutex
+	gate         chan struct{}
 	lastAttempt  time.Time
 	blockedUntil time.Time
+}
+
+type piHoleHealthStatus struct {
+	State     string
+	Message   string
+	CheckedAt time.Time
+}
+
+type piHoleHealthCheck struct {
+	done    chan struct{}
+	status  piHoleHealthStatus
+	waiters int
 }
 
 type piHoleAuthResponse struct {
@@ -51,29 +62,87 @@ type piHoleMessagesResponse struct {
 	} `json:"messages"`
 }
 
+type piHoleFTLResponse struct {
+	FTL struct {
+		PID    int     `json:"pid"`
+		Uptime float64 `json:"uptime"`
+	} `json:"ftl"`
+}
+
 func newPiHoleAPIClient(baseURL, password string) *piHoleAPIClient {
-	return &piHoleAPIClient{
+	client := &piHoleAPIClient{
 		baseURL:  strings.TrimRight(baseURL, "/"),
 		password: password,
+		gate:     make(chan struct{}, 1),
 		httpClient: &http.Client{
 			Timeout:       2 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}
+	client.gate <- struct{}{}
+	return client
+}
+
+func (c *piHoleAPIClient) checkHealth(ctx context.Context) (string, error) {
+	if err := c.lock(ctx); err != nil {
+		return "", err
+	}
+	defer c.unlock()
+	now := time.Now()
+	if now.Before(c.blockedUntil) {
+		return "", fmt.Errorf("API session checks paused until %s after an unconfirmed session cleanup", c.blockedUntil.Format(time.RFC3339))
+	}
+
+	sid, sessionUncertain, err := c.authenticate(ctx)
+	if err != nil {
+		if sessionUncertain {
+			c.blockedUntil = now.Add(30 * time.Minute)
+		}
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/info/ftl", nil)
+	if err != nil {
+		if sid != "" {
+			_ = c.logout(sid)
+		}
+		return "", err
+	}
+	setPiHoleSID(req, sid)
+	var response piHoleFTLResponse
+	readErr := c.doJSON(req, &response)
+	var logoutErr error
+	if sid != "" {
+		logoutErr = c.logout(sid)
+		if logoutErr != nil {
+			c.blockedUntil = now.Add(30 * time.Minute)
+		}
+	}
+	if err := errors.Join(readErr, logoutErr); err != nil {
+		return "", err
+	}
+	if response.FTL.PID <= 0 {
+		return "", errors.New("Pi-hole API returned invalid FTL status")
+	}
+	uptime := time.Duration(response.FTL.Uptime) * time.Millisecond
+	return fmt.Sprintf("FTL responding (PID %d, uptime %s)", response.FTL.PID, uptime.Round(time.Second)), nil
 }
 
 func (c *piHoleAPIClient) correlate(ctx context.Context, probeTime time.Time, queryName string) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	if err := c.lock(ctx); err != nil {
+		return "", err
+	}
+	defer c.unlock()
 	now := time.Now()
 	if now.Before(c.blockedUntil) || (!c.lastAttempt.IsZero() && now.Sub(c.lastAttempt) < piHoleCorrelationCooldown) {
 		return "", nil
 	}
 	c.lastAttempt = now
 
-	sid, err := c.authenticate(ctx)
+	sid, sessionUncertain, err := c.authenticate(ctx)
 	if err != nil {
-		c.blockedUntil = now.Add(30 * time.Minute)
+		if sessionUncertain {
+			c.blockedUntil = now.Add(30 * time.Minute)
+		}
 		return "pihole_api unavailable", err
 	}
 
@@ -94,19 +163,19 @@ func (c *piHoleAPIClient) correlate(ctx context.Context, probeTime time.Time, qu
 	return strings.Join(parts, "\n"), errors.Join(queryErr, messageErr, logoutErr)
 }
 
-func (c *piHoleAPIClient) authenticate(ctx context.Context) (string, error) {
+func (c *piHoleAPIClient) authenticate(ctx context.Context) (string, bool, error) {
 	body, err := json.Marshal(map[string]string{"password": c.password})
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/auth", bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	response, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("authenticate: %w", err)
+		return "", true, fmt.Errorf("authenticate: %w", err)
 	}
 	defer response.Body.Close()
 	body, readErr := io.ReadAll(io.LimitReader(response.Body, 64*1024+1))
@@ -114,10 +183,11 @@ func (c *piHoleAPIClient) authenticate(ctx context.Context) (string, error) {
 		readErr = errors.New("response too large")
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		cleanupUncertain := false
 		if sid := partialPiHoleSID(body); sid != "" {
-			_ = c.logout(sid)
+			cleanupUncertain = c.logout(sid) != nil
 		}
-		return "", fmt.Errorf("authenticate: HTTP %d", response.StatusCode)
+		return "", cleanupUncertain, fmt.Errorf("authenticate: HTTP %d", response.StatusCode)
 	}
 	var authResponse piHoleAuthResponse
 	decodeErr := json.Unmarshal(body, &authResponse)
@@ -126,21 +196,43 @@ func (c *piHoleAPIClient) authenticate(ctx context.Context) (string, error) {
 		if sid == "" {
 			sid = partialPiHoleSID(body)
 		}
+		cleanupUncertain := sid == ""
 		if sid != "" {
-			_ = c.logout(sid)
+			cleanupUncertain = c.logout(sid) != nil
 		}
-		return "", fmt.Errorf("authenticate: %w", errors.Join(readErr, decodeErr))
+		return "", cleanupUncertain, fmt.Errorf("authenticate: %w", errors.Join(readErr, decodeErr))
 	}
 	if !authResponse.Session.Valid {
+		cleanupUncertain := false
 		if authResponse.Session.SID != "" {
-			_ = c.logout(authResponse.Session.SID)
+			cleanupUncertain = c.logout(authResponse.Session.SID) != nil
 		}
-		return "", errors.New("authenticate: invalid session response")
+		return "", cleanupUncertain, errors.New("authenticate: invalid session response")
 	}
 	if authResponse.Session.SID == "" {
-		return "", nil
+		return "", false, nil
 	}
-	return authResponse.Session.SID, nil
+	return authResponse.Session.SID, false, nil
+}
+
+func (c *piHoleAPIClient) lock(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.gate:
+		if err := ctx.Err(); err != nil {
+			c.unlock()
+			return err
+		}
+		return nil
+	}
+}
+
+func (c *piHoleAPIClient) unlock() {
+	c.gate <- struct{}{}
 }
 
 func partialPiHoleSID(body []byte) string {

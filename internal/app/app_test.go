@@ -822,6 +822,16 @@ func TestDNSPathFragmentMarksStaleSamples(t *testing.T) {
 	}
 }
 
+func TestDNSPathBadgeDoesNotStretch(t *testing.T) {
+	css, err := webFiles.ReadFile("web/static/dns-paths.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(css), ".dns-path .badge") || !strings.Contains(string(css), "justify-self: start") {
+		t.Fatal("DNS path badge lacks compact grid alignment")
+	}
+}
+
 func TestParseAssetTargets(t *testing.T) {
 	targets, err := parseAssetTargets("Video|https://example.test/video.jpg\nNews|cache-bust|https://example.test/news.png;Map|http://example.test/map.webp")
 	if err != nil || len(targets) != 3 || targets[2].Name != "Map" || !targets[1].CacheBust {
