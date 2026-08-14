@@ -298,6 +298,47 @@ func TestDiagnosisReportsSlowSuccessfulDNSPath(t *testing.T) {
 	}
 }
 
+func TestDiagnosisCorrelatesTCPControls(t *testing.T) {
+	a := newTestApp(t)
+	base := []Sample{
+		{ProbeType: "dns", Target: "pihole", Severity: Info, Success: true, DurationMS: 10},
+		{ProbeType: "dns", Target: "pihole-udp", Severity: Info, Success: true, DurationMS: 10},
+		{ProbeType: "dns", Target: "public-dns", Severity: Info, Success: true, DurationMS: 15},
+		{ProbeType: "doh", Target: "direct-doh", Severity: Info, Success: true, DurationMS: 40},
+		{ProbeType: "tcp", Target: "internet-tcp", Severity: Warning, Success: true, ConnectMS: 1050, Message: "TCP connection above 250 ms to 1.1.1.1:443"},
+		{ProbeType: "http", Target: "http", Severity: Info, Success: true, ConnectMS: 30, DurationMS: 80},
+	}
+	_, issues, _ := a.diagnoseSamples(base)
+	message := issueMessage(issues, "tcp_connect")
+	for _, text := range []string{"1.1.1.1:443", "direct DNS=healthy (15ms)", "HTTP connect=healthy (30ms)", "not a broad outage"} {
+		if !strings.Contains(message, text) {
+			t.Fatalf("TCP correlation missing %q: %s", text, message)
+		}
+	}
+
+	base[5] = Sample{ProbeType: "http", Target: "http", Severity: Error, ConnectMS: 30, StatusCode: 500, Message: "unexpected status"}
+	_, issues, _ = a.diagnoseSamples(base)
+	message = issueMessage(issues, "tcp_connect")
+	if !strings.Contains(message, "HTTP connect=healthy (30ms)") || !strings.Contains(message, "not a broad outage") {
+		t.Fatalf("HTTP application error misclassified as connect failure: %s", message)
+	}
+
+	base[5] = Sample{ProbeType: "http", Target: "http", Severity: Error, ConnectMS: 30, Message: "failed", connectFailed: true}
+	_, issues, _ = a.diagnoseSamples(base)
+	if message = issueMessage(issues, "tcp_connect"); !strings.Contains(message, "broader connectivity trouble") {
+		t.Fatalf("broad TCP degradation not identified: %s", message)
+	}
+}
+
+func issueMessage(issues []Sample, target string) string {
+	for _, issue := range issues {
+		if issue.Target == target {
+			return issue.Message
+		}
+	}
+	return ""
+}
+
 func TestIncidentHysteresisAndCauseUpdate(t *testing.T) {
 	a := newTestApp(t)
 	bad := Sample{ProbeType: "aggregate", Target: "local_dns", Severity: Error, Message: "Pi-hole failed"}
@@ -335,6 +376,69 @@ func TestIncidentHysteresisAndCauseUpdate(t *testing.T) {
 	a.updateIncident(context.Background(), healthy)
 	if active, _ = activeIncident(context.Background(), a.db); active != nil {
 		t.Fatal("incident did not recover after three cycles")
+	}
+}
+
+func TestIncidentKeepsPeakAndRecordsEventSeverity(t *testing.T) {
+	a := newTestApp(t)
+	failed := Sample{ProbeType: "aggregate", Target: "tcp_connect", Severity: Error, Message: "TCP 1.1.1.1:443 timed out"}
+	a.updateIncident(context.Background(), failed)
+	a.updateIncident(context.Background(), failed)
+	warning := Sample{ProbeType: "aggregate", Target: "tcp_connect", Severity: Warning, Message: "TCP 1.1.1.1:443 recovered slowly"}
+	a.updateIncident(context.Background(), warning)
+	incident, err := activeIncident(context.Background(), a.db)
+	if err != nil || incident == nil {
+		t.Fatalf("active incident: %+v, err=%v", incident, err)
+	}
+	if incident.Severity != Error || incident.Summary != warning.Message || !strings.Contains(incident.Evidence, "event_severity=warning") {
+		t.Fatalf("peak and event severity conflated: %+v", incident)
+	}
+}
+
+func TestIncidentKeepsPeakBeforeOpening(t *testing.T) {
+	a := newTestApp(t)
+	a.updateIncident(context.Background(), Sample{ProbeType: "aggregate", Target: "tcp_connect", Severity: Error, Message: "timed out"})
+	a.updateIncident(context.Background(), Sample{ProbeType: "aggregate", Target: "tcp_connect", Severity: Warning, Message: "slow"})
+	incident, err := activeIncident(context.Background(), a.db)
+	if err != nil || incident == nil || incident.Severity != Error || incident.Summary != "slow" || !strings.Contains(incident.Evidence, "event_severity=error") || !strings.Contains(incident.Evidence, "event_severity=warning") {
+		t.Fatalf("pre-open peak lost: incident=%+v err=%v", incident, err)
+	}
+}
+
+func TestIncidentEvidenceRetainsPeakWhenTruncated(t *testing.T) {
+	a := newTestApp(t)
+	warning := Sample{ProbeType: "aggregate", Target: "tcp_connect", Severity: Warning, Message: "initial warning"}
+	a.updateIncident(context.Background(), warning)
+	a.updateIncident(context.Background(), warning)
+	a.updateIncident(context.Background(), Sample{ProbeType: "aggregate", Target: "tcp_connect", Severity: Error, Message: "peak timeout evidence"})
+	for range 80 {
+		a.updateIncident(context.Background(), Sample{ProbeType: "aggregate", Target: "tcp_connect", Severity: Warning, Message: strings.Repeat("later warning ", 20)})
+	}
+	incident, err := activeIncident(context.Background(), a.db)
+	if err != nil || incident == nil || !strings.Contains(incident.Evidence, "peak timeout evidence") || !strings.Contains(incident.Evidence, "older events truncated") {
+		t.Fatalf("peak evidence lost: incident=%+v err=%v", incident, err)
+	}
+}
+
+func TestConnectionTracePrefersSuccessfulAttempt(t *testing.T) {
+	trace := newConnectionTrace()
+	trace.start("tcp6", "[2001:db8::1]:443")
+	trace.start("tcp4", "192.0.2.1:443")
+	trace.done("tcp4", "192.0.2.1:443", nil)
+	successDuration := trace.duration()
+	time.Sleep(time.Millisecond)
+	trace.done("tcp6", "[2001:db8::1]:443", errors.New("canceled loser"))
+	if trace.duration() != successDuration {
+		t.Fatalf("failed parallel attempt replaced successful duration: before=%v after=%v", successDuration, trace.duration())
+	}
+}
+
+func TestTCPProbeMessageIncludesDestination(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	sample := probeTCP(ctx, "internet-tcp", "192.0.2.1:443")
+	if !strings.Contains(sample.Message, "192.0.2.1:443") {
+		t.Fatalf("TCP destination missing: %+v", sample)
 	}
 }
 
@@ -669,16 +773,22 @@ func TestIncidentPagination(t *testing.T) {
 	}
 }
 
-func TestIncidentPaginationDisplaysOneBasedPage(t *testing.T) {
+func TestIncidentPaginationShowsOnlyDirectionalControls(t *testing.T) {
 	a := newTestApp(t)
 	result := httptest.NewRecorder()
 	a.render(result, "incidents.html", map[string]any{
-		"Incidents":   []Incident{{StartedAt: time.Now(), Severity: Warning, Category: "tcp_connect", Summary: "slow"}},
-		"DisplayPage": 1,
+		"Incidents": []Incident{{StartedAt: time.Now(), Severity: Warning, Category: "tcp_connect", Summary: "slow"}},
+		"Next":      true,
+		"NextPage":  1,
 	})
 	body := result.Body.String()
-	if !strings.Contains(body, "Page 1") || strings.Contains(body, "Page 0") {
+	if !strings.Contains(body, ">Older<") || strings.Contains(body, "Page ") {
 		t.Fatalf("unexpected pagination: %s", body)
+	}
+	result = httptest.NewRecorder()
+	a.render(result, "incidents.html", map[string]any{"Incidents": []Incident{{StartedAt: time.Now(), Severity: Warning, Category: "tcp_connect", Summary: "slow"}}})
+	if strings.Contains(result.Body.String(), `<nav class="pagination">`) {
+		t.Fatalf("empty pagination rendered: %s", result.Body.String())
 	}
 }
 

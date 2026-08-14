@@ -17,6 +17,7 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -31,6 +32,51 @@ var sharedDoHClient = &http.Client{Transport: &http.Transport{
 	TLSHandshakeTimeout: 4 * time.Second,
 }}
 
+type connectionTrace struct {
+	mu        sync.Mutex
+	started   map[string]time.Time
+	success   float64
+	failed    float64
+	connected bool
+}
+
+func newConnectionTrace() *connectionTrace {
+	return &connectionTrace{started: make(map[string]time.Time)}
+}
+
+func (t *connectionTrace) start(network, address string) {
+	t.mu.Lock()
+	t.started[network+"\x00"+address] = time.Now()
+	t.mu.Unlock()
+}
+
+func (t *connectionTrace) done(network, address string, err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	key := network + "\x00" + address
+	started := t.started[key]
+	delete(t.started, key)
+	if started.IsZero() {
+		return
+	}
+	duration := ms(time.Since(started))
+	if err == nil {
+		t.success = duration
+		t.connected = true
+	} else if duration > t.failed {
+		t.failed = duration
+	}
+}
+
+func (t *connectionTrace) duration() float64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.connected {
+		return t.success
+	}
+	return t.failed
+}
+
 func probeTCP(ctx context.Context, name, address string) Sample {
 	started := time.Now()
 	s := Sample{CreatedAt: started, ProbeType: "tcp", Target: name, Severity: Info}
@@ -38,12 +84,17 @@ func probeTCP(ctx context.Context, name, address string) Sample {
 	s.DurationMS = ms(time.Since(started))
 	s.ConnectMS = s.DurationMS
 	if err != nil {
-		s.Severity, s.Message = Error, err.Error()
+		s.Severity, s.Message = Error, fmt.Sprintf("TCP %s: %v", address, err)
 		return s
 	}
 	_ = conn.Close()
 	s.Success = true
 	s.Severity, s.Message = classifyLatency(s.DurationMS, "TCP connection")
+	if s.Severity == Info {
+		s.Message = fmt.Sprintf("TCP %s connected", address)
+	} else {
+		s.Message += " to " + address
+	}
 	return s
 }
 
@@ -108,14 +159,11 @@ func probeDoH(ctx context.Context, target, endpoint string) Sample {
 		s.Severity, s.Message = Error, err.Error()
 		return s
 	}
-	var connectStart, tlsStart, wroteRequest time.Time
+	connections := newConnectionTrace()
+	var tlsStart, wroteRequest time.Time
 	trace := &httptrace.ClientTrace{
-		ConnectStart: func(_, _ string) { connectStart = time.Now() },
-		ConnectDone: func(_, _ string, _ error) {
-			if !connectStart.IsZero() {
-				s.ConnectMS = ms(time.Since(connectStart))
-			}
-		},
+		ConnectStart:      connections.start,
+		ConnectDone:       connections.done,
 		TLSHandshakeStart: func() { tlsStart = time.Now() },
 		TLSHandshakeDone: func(tls.ConnectionState, error) {
 			if !tlsStart.IsZero() {
@@ -140,6 +188,7 @@ func probeDoH(ctx context.Context, target, endpoint string) Sample {
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("User-Agent", "stormwarden/1.0")
 	resp, err := sharedDoHClient.Do(req)
+	s.ConnectMS = connections.duration()
 	if err != nil {
 		s.DurationMS = ms(time.Since(started))
 		s.Severity, s.Message = Error, redactHTTPError(err, endpoint)
@@ -301,7 +350,8 @@ func probeHTTPStatus(ctx context.Context, probeType, url string, limit int64, ex
 func probeHTTPStatusResolver(ctx context.Context, probeType, url string, limit int64, expectedStatus int, dnsAddress string) Sample {
 	started := time.Now()
 	s := Sample{CreatedAt: started, ProbeType: probeType, Target: redactURL(url), Severity: Info}
-	var dnsStart, connectStart, tlsStart, wroteRequest time.Time
+	connections := newConnectionTrace()
+	var dnsStart, tlsStart, wroteRequest time.Time
 	trace := &httptrace.ClientTrace{
 		DNSStart: func(httptrace.DNSStartInfo) { dnsStart = time.Now() },
 		DNSDone: func(httptrace.DNSDoneInfo) {
@@ -309,12 +359,8 @@ func probeHTTPStatusResolver(ctx context.Context, probeType, url string, limit i
 				s.DNSMS = ms(time.Since(dnsStart))
 			}
 		},
-		ConnectStart: func(_, _ string) { connectStart = time.Now() },
-		ConnectDone: func(_, _ string, _ error) {
-			if !connectStart.IsZero() {
-				s.ConnectMS = ms(time.Since(connectStart))
-			}
-		},
+		ConnectStart:      connections.start,
+		ConnectDone:       connections.done,
 		TLSHandshakeStart: func() { tlsStart = time.Now() },
 		TLSHandshakeDone: func(tls.ConnectionState, error) {
 			if !tlsStart.IsZero() {
@@ -349,7 +395,9 @@ func probeHTTPStatusResolver(ctx context.Context, probeType, url string, limit i
 	}
 	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true, TLSHandshakeTimeout: 4 * time.Second, DialContext: dialer.DialContext}}
 	resp, err := client.Do(req)
+	s.ConnectMS = connections.duration()
 	if err != nil {
+		s.connectFailed = isTCPConnectFailure(err)
 		s.DurationMS = ms(time.Since(started))
 		s.Severity, s.Message = Error, redactHTTPError(err, url)
 		return s
@@ -404,6 +452,15 @@ func probeHTTPStatusResolver(ctx context.Context, probeType, url string, limit i
 	}
 	s.Severity, s.Message = Info, "healthy"
 	return s
+}
+
+func isTCPConnectFailure(err error) bool {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return false
+	}
+	var networkErr *net.OpError
+	return errors.As(err, &networkErr) && networkErr.Op == "dial"
 }
 
 func classifyLatency(value float64, label string) (Severity, string) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -280,7 +281,10 @@ func (a *App) cleanupExports() {
 	}
 }
 
-type incidentState struct{ badCycles, healthyCycles int }
+type incidentState struct {
+	badCycles, healthyCycles int
+	peakIssue                Sample
+}
 
 func (a *App) runProbeCycle(ctx context.Context) {
 	if !a.probeMu.TryLock() {
@@ -394,7 +398,9 @@ func (a *App) diagnoseSamples(samples []Sample) (Sample, []Sample, map[string]bo
 		issues = append(issues, issue)
 	}
 	if hasTCP && tcp.Severity != Info {
-		issues = append(issues, incidentSample(tcp, "tcp_connect"))
+		issue := incidentSample(tcp, "tcp_connect")
+		issue.Message += tcpControlContext(publicDNS, hasPublic, doh, hasDoH, httpSample, hasHTTP)
+		issues = append(issues, issue)
 	}
 	if hasHTTP && httpSample.Severity != Info && (!hasPiHole || pihole.Success) && (!hasTCP || tcp.Success) {
 		issues = append(issues, incidentSample(httpSample, categoryFor(httpSample)))
@@ -474,6 +480,7 @@ func (a *App) updateIncidents(ctx context.Context, issues []Sample, observed map
 		}
 		if !failing {
 			state.badCycles = 0
+			state.peakIssue = Sample{}
 			state.healthyCycles++
 			if isActive && state.healthyCycles >= 3 {
 				if err := closeIncident(ctx, a.db, incident.ID); err != nil {
@@ -485,20 +492,66 @@ func (a *App) updateIncidents(ctx context.Context, issues []Sample, observed map
 		state.healthyCycles = 0
 		state.badCycles++
 		if !isActive {
+			if state.badCycles == 1 || severityRank(issue.Severity) > severityRank(state.peakIssue.Severity) {
+				state.peakIssue = issue
+			}
 			if state.badCycles >= 2 {
-				if err := openIncident(ctx, a.db, issue); err != nil {
+				if err := openIncidentWithPeak(ctx, a.db, issue, state.peakIssue); err != nil {
 					a.logger.Error("incident creation failed", "category", category, "error", err)
 				}
 			}
 			continue
 		}
-		if severityRank(incident.Severity) > severityRank(issue.Severity) {
-			issue.Severity = incident.Severity
+		peakSeverity := issue.Severity
+		promotePeak := severityRank(issue.Severity) > severityRank(incident.Severity)
+		if severityRank(incident.Severity) > severityRank(peakSeverity) {
+			peakSeverity = incident.Severity
 		}
-		if err := updateIncident(ctx, a.db, incident.ID, issue); err != nil {
+		if err := updateIncident(ctx, a.db, incident.ID, issue, peakSeverity, promotePeak); err != nil {
 			a.logger.Error("incident update failed", "category", category, "error", err)
 		}
 	}
+}
+
+func tcpControlContext(publicDNS Sample, hasPublic bool, doh Sample, hasDoH bool, httpSample Sample, hasHTTP bool) string {
+	dnsState := controlState(publicDNS, hasPublic, publicDNS.DurationMS)
+	dohState := controlState(doh, hasDoH, doh.DurationMS)
+	httpState := httpConnectState(httpSample, hasHTTP)
+	assessment := "insufficient healthy controls to isolate scope"
+	httpConnectFailed := hasHTTP && httpSample.connectFailed
+	httpConnectHealthy := hasHTTP && httpSample.ConnectMS > 0 && httpSample.ConnectMS <= 250 && !httpConnectFailed
+	if httpConnectHealthy && ((hasPublic && publicDNS.Success) || (hasDoH && doh.Success)) {
+		assessment = "likely Cloudflare TCP control-path degradation, not a broad outage"
+	} else if httpConnectFailed || (hasHTTP && httpSample.ConnectMS > 250) {
+		assessment = "multiple outbound TCP/HTTPS paths degraded; likely broader connectivity trouble"
+	}
+	return fmt.Sprintf(". Same-cycle controls: direct DNS=%s, DoH=%s, HTTP connect=%s. Assessment: %s", dnsState, dohState, httpState, assessment)
+}
+
+func httpConnectState(sample Sample, present bool) string {
+	if !present || sample.ConnectMS <= 0 {
+		return "unavailable"
+	}
+	if sample.connectFailed {
+		return fmt.Sprintf("error (%.0fms)", sample.ConnectMS)
+	}
+	severity, _ := classifyLatency(sample.ConnectMS, "HTTP connection")
+	state := string(severity)
+	if severity == Info {
+		state = "healthy"
+	}
+	return fmt.Sprintf("%s (%.0fms)", state, sample.ConnectMS)
+}
+
+func controlState(sample Sample, present bool, durationMS float64) string {
+	if !present {
+		return "unavailable"
+	}
+	state := string(sample.Severity)
+	if sample.Success && sample.Severity == Info {
+		state = "healthy"
+	}
+	return fmt.Sprintf("%s (%.0fms)", state, durationMS)
 }
 
 func severityRank(s Severity) int {

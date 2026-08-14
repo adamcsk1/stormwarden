@@ -435,10 +435,15 @@ func incidentPage(ctx context.Context, db *sql.DB, limit, offset int) ([]Inciden
 }
 
 func openIncident(ctx context.Context, db *sql.DB, s Sample) error {
-	category := categoryFor(s)
-	summary := fmt.Sprintf("%s probe degraded: %s", s.ProbeType, s.Message)
-	evidence := fmt.Sprintf("target=%s duration=%.0fms dns=%.0fms connect=%.0fms tls=%.0fms ttfb=%.0fms throughput=%.2fMbps", s.Target, s.DurationMS, s.DNSMS, s.ConnectMS, s.TLSMS, s.TTFBMS, s.Mbps)
-	_, err := db.ExecContext(ctx, `INSERT INTO incidents(started_at, severity, category, summary, evidence) VALUES (?, ?, ?, ?, ?)`, dbTime(time.Now()), s.Severity, category, summary, evidence)
+	return openIncidentWithPeak(ctx, db, s, s)
+}
+
+func openIncidentWithPeak(ctx context.Context, db *sql.DB, current, peak Sample) error {
+	evidence := incidentEvidence(peak)
+	if current.Severity != peak.Severity || current.Message != peak.Message || current.DurationMS != peak.DurationMS {
+		evidence += "\n" + incidentEvidence(current)
+	}
+	_, err := db.ExecContext(ctx, `INSERT INTO incidents(started_at, severity, category, summary, evidence) VALUES (?, ?, ?, ?, ?)`, dbTime(time.Now()), peak.Severity, categoryFor(current), current.Message, evidence)
 	return err
 }
 
@@ -447,10 +452,39 @@ func closeIncident(ctx context.Context, db *sql.DB, id int64) error {
 	return err
 }
 
-func updateIncident(ctx context.Context, db *sql.DB, id int64, s Sample) error {
-	evidence := fmt.Sprintf("\n%s target=%s severity=%s duration=%.0fms dns=%.0fms connect=%.0fms tls=%.0fms ttfb=%.0fms throughput=%.2fMbps message=%s", time.Now().UTC().Format(time.RFC3339), s.Target, s.Severity, s.DurationMS, s.DNSMS, s.ConnectMS, s.TLSMS, s.TTFBMS, s.Mbps, s.Message)
-	_, err := db.ExecContext(ctx, `UPDATE incidents SET severity=?, category=?, summary=?, evidence=substr(evidence || ?, -12000) WHERE id=? AND ended_at IS NULL`, s.Severity, s.Target, s.Message, evidence, id)
+func updateIncident(ctx context.Context, db *sql.DB, id int64, s Sample, peakSeverity Severity, promotePeak bool) error {
+	var existing string
+	if err := db.QueryRowContext(ctx, `SELECT evidence FROM incidents WHERE id=? AND ended_at IS NULL`, id).Scan(&existing); err != nil {
+		return err
+	}
+	evidence := mergeIncidentEvidence(existing, incidentEvidence(s), promotePeak)
+	_, err := db.ExecContext(ctx, `UPDATE incidents SET severity=?, category=?, summary=?, evidence=? WHERE id=? AND ended_at IS NULL`, peakSeverity, s.Target, s.Message, evidence, id)
 	return err
+}
+
+func mergeIncidentEvidence(existing, current string, promotePeak bool) string {
+	combined := existing + "\n" + current
+	if promotePeak {
+		combined = current + "\n" + existing
+	}
+	runes := []rune(combined)
+	if len(runes) <= 12000 {
+		return combined
+	}
+	peak, history, _ := strings.Cut(combined, "\n")
+	historyRunes := []rune(history)
+	if len(historyRunes) > 10000 {
+		historyRunes = historyRunes[len(historyRunes)-10000:]
+	}
+	return peak + "\n... older events truncated ...\n" + string(historyRunes)
+}
+
+func incidentEvidence(s Sample) string {
+	at := s.CreatedAt
+	if at.IsZero() {
+		at = time.Now()
+	}
+	return fmt.Sprintf("%s event_severity=%s target=%s duration=%.0fms dns=%.0fms connect=%.0fms tls=%.0fms ttfb=%.0fms throughput=%.2fMbps message=%s", at.UTC().Format(time.RFC3339), s.Severity, s.Target, s.DurationMS, s.DNSMS, s.ConnectMS, s.TLSMS, s.TTFBMS, s.Mbps, s.Message)
 }
 
 func cleanup(ctx context.Context, db *sql.DB, rawRetention time.Duration) error {

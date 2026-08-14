@@ -12,21 +12,22 @@ const (
 )
 
 type Sample struct {
-	ID         int64     `json:"id"`
-	CreatedAt  time.Time `json:"created_at"`
-	ProbeType  string    `json:"probe_type"`
-	Target     string    `json:"target"`
-	Severity   Severity  `json:"severity"`
-	Success    bool      `json:"success"`
-	DurationMS float64   `json:"duration_ms"`
-	DNSMS      float64   `json:"dns_ms,omitempty"`
-	ConnectMS  float64   `json:"connect_ms,omitempty"`
-	TLSMS      float64   `json:"tls_ms,omitempty"`
-	TTFBMS     float64   `json:"ttfb_ms,omitempty"`
-	Bytes      int64     `json:"bytes,omitempty"`
-	Mbps       float64   `json:"mbps,omitempty"`
-	StatusCode int       `json:"status_code,omitempty"`
-	Message    string    `json:"message,omitempty"`
+	ID            int64     `json:"id"`
+	CreatedAt     time.Time `json:"created_at"`
+	ProbeType     string    `json:"probe_type"`
+	Target        string    `json:"target"`
+	Severity      Severity  `json:"severity"`
+	Success       bool      `json:"success"`
+	DurationMS    float64   `json:"duration_ms"`
+	DNSMS         float64   `json:"dns_ms,omitempty"`
+	ConnectMS     float64   `json:"connect_ms,omitempty"`
+	TLSMS         float64   `json:"tls_ms,omitempty"`
+	TTFBMS        float64   `json:"ttfb_ms,omitempty"`
+	Bytes         int64     `json:"bytes,omitempty"`
+	Mbps          float64   `json:"mbps,omitempty"`
+	StatusCode    int       `json:"status_code,omitempty"`
+	Message       string    `json:"message,omitempty"`
+	connectFailed bool
 }
 
 type Incident struct {
