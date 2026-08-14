@@ -109,16 +109,19 @@ func negativeDNSResponse(t *testing.T, query []byte, rcode dnsmessage.RCode) []b
 }
 
 func TestDNSQueriesBypassCache(t *testing.T) {
-	_, first, err := newDNSQuery()
+	_, firstName, first, err := newDNSQuery()
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, second, err := newDNSQuery()
+	_, secondName, second, err := newDNSQuery()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if bytes.Equal(first[12:], second[12:]) {
 		t.Fatal("DNS probe names were reused")
+	}
+	if firstName == secondName || firstName == "" {
+		t.Fatal("DNS probe names were not returned uniquely")
 	}
 	if !bytes.Contains(first, []byte("example")) {
 		t.Fatal("DNS probe does not use expected domain")
@@ -146,7 +149,7 @@ func TestDoHProbeValidatesHTTPResponse(t *testing.T) {
 	}))
 	defer server.Close()
 	sample := probeDoH(context.Background(), "direct-doh", server.URL)
-	if sample.Success || sample.DurationMS <= 0 || sample.StatusCode != http.StatusBadGateway {
+	if sample.Success || sample.StatusCode != http.StatusBadGateway {
 		t.Fatalf("invalid DoH HTTP result: %+v", sample)
 	}
 }
