@@ -49,7 +49,7 @@ For HTTPS behind reverse proxy, set `APP_COOKIE_SECURE=true`. Do not expose plai
 | `DATA_PATH` | `/data/stormwarden.db` | SQLite location in image |
 | `EXPORT_DIR` | `/data/exports` | Generated reports |
 
-## AI Reports
+## Diagnostic Reports
 
 Dashboard generates last-day or last-week ZIP reports. Each report contains:
 

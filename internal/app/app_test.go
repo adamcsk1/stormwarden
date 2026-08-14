@@ -525,3 +525,16 @@ func TestIncidentPagination(t *testing.T) {
 		t.Fatalf("second page len=%d more=%v err=%v", len(second), more, err)
 	}
 }
+
+func TestIncidentPaginationDisplaysOneBasedPage(t *testing.T) {
+	a := newTestApp(t)
+	result := httptest.NewRecorder()
+	a.render(result, "incidents.html", map[string]any{
+		"Incidents":   []Incident{{StartedAt: time.Now(), Severity: Warning, Category: "tcp_connect", Summary: "slow"}},
+		"DisplayPage": 1,
+	})
+	body := result.Body.String()
+	if !strings.Contains(body, "Page 1") || strings.Contains(body, "Page 0") {
+		t.Fatalf("unexpected pagination: %s", body)
+	}
+}
