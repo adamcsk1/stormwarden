@@ -148,7 +148,7 @@ func (a *App) processExport(ctx context.Context, job exportJob) error {
 	if err := temp.Close(); err != nil {
 		return err
 	}
-	finalPath := filepath.Join(a.cfg.ExportDir, fmt.Sprintf("internet-analyzer-%s-%s.zip", job.RangeName, job.ID))
+	finalPath := filepath.Join(a.cfg.ExportDir, fmt.Sprintf("stormwarden-%s-%s.zip", job.RangeName, job.ID))
 	if err := os.Rename(tempPath, finalPath); err != nil {
 		return err
 	}
@@ -193,7 +193,7 @@ func (a *App) writeExport(ctx context.Context, zw *zip.Writer, from, to time.Tim
 	if total > 0 {
 		availability = float64(successful) * 100 / float64(total)
 	}
-	summary := fmt.Sprintf("# Internet Analyzer Diagnostic Report\n\nObservation period: %s to %s\nGenerated: %s\nTraffic profile: %s\n\n## Summary\n\n- Health cycles: %d\n- Availability: %.2f%%\n- Warning cycles: %d\n- Error cycles: %d\n- Critical cycles: %d\n- Incidents: %d\n\n## Interpretation\n\nCompare Pi-hole DNS with public DNS samples to isolate local resolver failures. HTTP records split DNS, TCP connect, TLS, time-to-first-byte, body transfer speed, and total duration. Aggregate records represent household connectivity per probe cycle.\n\n## Privacy\n\nAuthentication secrets, sessions, cookies, headers, and DNS answers are excluded. Configured targets remain because diagnosis requires them.\n", from.In(a.cfg.Timezone).Format(time.RFC3339), to.In(a.cfg.Timezone).Format(time.RFC3339), time.Now().In(a.cfg.Timezone).Format(time.RFC3339), profile, total, availability, warnings, errorCount, criticals, incidentCount)
+	summary := fmt.Sprintf("# Stormwarden Diagnostic Report\n\nObservation period: %s to %s\nGenerated: %s\nTraffic profile: %s\n\n## Summary\n\n- Health cycles: %d\n- Availability: %.2f%%\n- Warning cycles: %d\n- Error cycles: %d\n- Critical cycles: %d\n- Incidents: %d\n\n## Interpretation\n\nCompare Pi-hole DNS with public DNS samples to isolate local resolver failures. HTTP records split DNS, TCP connect, TLS, time-to-first-byte, body transfer speed, and total duration. Aggregate records represent household connectivity per probe cycle.\n\n## Privacy\n\nAuthentication secrets, sessions, cookies, headers, and DNS answers are excluded. Configured targets remain because diagnosis requires them.\n", from.In(a.cfg.Timezone).Format(time.RFC3339), to.In(a.cfg.Timezone).Format(time.RFC3339), time.Now().In(a.cfg.Timezone).Format(time.RFC3339), profile, total, availability, warnings, errorCount, criticals, incidentCount)
 	if err := zipText(zw, "README.md", "Upload summary.md and JSONL files to an AI agent. JSONL contains one JSON object per line. Raw data retains 30 days; rollups preserve older trends.\n"); err != nil {
 		return err
 	}
@@ -359,7 +359,7 @@ func (a *App) downloadExport(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid export path", http.StatusForbidden)
 		return
 	}
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="internet-analyzer-%s-%s.zip"`, rangeName, time.Now().Format("20060102")))
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="stormwarden-%s-%s.zip"`, rangeName, time.Now().Format("20060102")))
 	w.Header().Set("Content-Type", "application/zip")
 	http.ServeFile(w, r, cleanPath)
 }

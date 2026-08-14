@@ -134,7 +134,7 @@ func probeHTTPStatus(ctx context.Context, probeType, url string, limit int64, ex
 		s.Severity, s.Message = Error, err.Error()
 		return s
 	}
-	req.Header.Set("User-Agent", "internet-analyzer/1.0")
+	req.Header.Set("User-Agent", "stormwarden/1.0")
 	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true, TLSHandshakeTimeout: 4 * time.Second}}
 	resp, err := client.Do(req)
 	if err != nil {

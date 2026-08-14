@@ -1,4 +1,4 @@
-# Internet Analyzer
+# Stormwarden
 
 Dockerized Go service for recording intermittent DNS and internet performance problems. It compares Pi-hole TCP DNS with public DNS, measures TCP connectivity and HTTP phases, records incidents, and provides password-protected HTMX reports.
 
@@ -45,7 +45,7 @@ For HTTPS behind reverse proxy, set `APP_COOKIE_SECURE=true`. Do not expose plai
 | `APP_TIMEZONE` | `Europe/Budapest` | Display timezone |
 | `APP_COOKIE_SECURE` | `false` | Require HTTPS session cookies |
 | `APP_LISTEN_ADDR` | `:8080` | HTTP listen address; Docker health check follows its port |
-| `DATA_PATH` | `/data/internet-analyzer.db` | SQLite location in image |
+| `DATA_PATH` | `/data/stormwarden.db` | SQLite location in image |
 | `EXPORT_DIR` | `/data/exports` | Generated reports |
 
 ## AI Reports
@@ -68,7 +68,7 @@ HTMX is committed as local static asset so UI remains functional during internet
 npm install
 npm run vendor
 go test ./...
-go run ./cmd/internet-analyzer
+go run ./cmd/stormwarden
 ```
 
 `APP_PASSWORD` must be set for local execution.

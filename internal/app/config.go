@@ -41,7 +41,7 @@ func LoadConfig() (Config, error) {
 	return Config{
 		ListenAddr:         env("APP_LISTEN_ADDR", ":8080"),
 		Password:           password,
-		DataPath:           env("DATA_PATH", "data/internet-analyzer.db"),
+		DataPath:           env("DATA_PATH", "data/stormwarden.db"),
 		ExportDir:          env("EXPORT_DIR", "data/exports"),
 		PiHoleAddr:         env("PIHOLE_DNS_ADDR", "127.0.0.1:53"),
 		PublicDNS:          env("PUBLIC_DNS_ADDR", "1.1.1.1:53"),
