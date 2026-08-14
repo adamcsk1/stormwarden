@@ -15,6 +15,7 @@ type Config struct {
 	PiHoleAddr         string
 	PublicDNS          string
 	DoHURL             string
+	AssetTargets       string
 	HTTPURL            string
 	HTTPDNSAddr        string
 	TransferURL        string
@@ -41,6 +42,10 @@ func LoadConfig() (Config, error) {
 		return Config{}, errors.New("HTTP_EXPECTED_STATUS must be 0 or a valid HTTP status")
 	}
 	piholeAddr := env("PIHOLE_DNS_ADDR", "127.0.0.1:53")
+	assetTargets := env("ASSET_PROBES", defaultAssetTargets)
+	if _, err := parseAssetTargets(assetTargets); err != nil {
+		return Config{}, err
+	}
 	return Config{
 		ListenAddr:         env("APP_LISTEN_ADDR", ":8080"),
 		Password:           password,
@@ -49,6 +54,7 @@ func LoadConfig() (Config, error) {
 		PiHoleAddr:         piholeAddr,
 		PublicDNS:          env("PUBLIC_DNS_ADDR", "1.1.1.1:53"),
 		DoHURL:             env("DOH_PROBE_URL", "https://1.1.1.1/dns-query"),
+		AssetTargets:       assetTargets,
 		HTTPURL:            env("HTTP_PROBE_URL", "https://www.google.com/generate_204"),
 		HTTPDNSAddr:        env("HTTP_DNS_ADDR", piholeAddr),
 		TransferURL:        env("TRANSFER_PROBE_URL", "https://speed.cloudflare.com/__down?bytes=262144"),

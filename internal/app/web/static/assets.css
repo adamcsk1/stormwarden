@@ -1,0 +1,58 @@
+.asset-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.asset-card {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #0b1714;
+}
+
+.asset-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.asset-card dl {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0 0 12px;
+}
+
+.asset-card dl div {
+  min-width: 0;
+}
+
+.asset-card dt,
+.asset-card small {
+  color: var(--muted);
+}
+
+.asset-card dt {
+  font-size: .68rem;
+  text-transform: uppercase;
+}
+
+.asset-card dd {
+  margin: 2px 0 0;
+  font-size: .82rem;
+}
+
+@media (max-width: 850px) {
+  .asset-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 520px) {
+  .asset-card dl {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

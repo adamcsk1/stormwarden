@@ -355,6 +355,7 @@ func probeHTTPStatusResolver(ctx context.Context, probeType, url string, limit i
 		return s
 	}
 	defer resp.Body.Close()
+	s.DurationMS = ms(time.Since(started))
 	s.StatusCode = resp.StatusCode
 	statusInvalid := expectedStatus > 0 && resp.StatusCode != expectedStatus
 	if expectedStatus == 0 {
@@ -373,15 +374,17 @@ func probeHTTPStatusResolver(ctx context.Context, probeType, url string, limit i
 		return s
 	}
 	s.Success = true
+	if (probeType == "transfer" || probeType == "asset") && s.Bytes > 0 {
+		if bodyDuration <= 0 {
+			bodyDuration = time.Microsecond
+		}
+		s.Mbps = float64(s.Bytes*8) / bodyDuration.Seconds() / 1_000_000
+	}
 	if probeType == "transfer" {
 		if s.Bytes != limit {
 			s.Success, s.Severity, s.Message = false, Error, fmt.Sprintf("short transfer: received %d of %d bytes", s.Bytes, limit)
 			return s
 		}
-		if bodyDuration <= 0 {
-			bodyDuration = time.Microsecond
-		}
-		s.Mbps = float64(s.Bytes*8) / bodyDuration.Seconds() / 1_000_000
 		if s.Mbps < 1 {
 			s.Severity, s.Message = Error, "transfer below 1 Mbps"
 			return s

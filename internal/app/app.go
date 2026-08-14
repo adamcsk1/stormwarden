@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
@@ -19,11 +20,14 @@ type App struct {
 	startedAt      time.Time
 	sessions       *sessionStore
 	probeMu        sync.Mutex
+	assetMu        sync.Mutex
+	incidentMu     sync.Mutex
 	dataMu         sync.RWMutex
 	healthMu       sync.RWMutex
 	lastPersist    time.Time
 	lastPersistErr error
 	lastTransfer   time.Time
+	lastAssetProbe time.Time
 	criticalCycles int
 	incidentStates map[string]*incidentState
 	exportJobs     chan exportJob
@@ -108,8 +112,22 @@ func New(cfg Config, logger *slog.Logger) (*App, error) {
 		lastTransfer = time.Now()
 	}
 	lastPersist, _ := latestSampleTime(context.Background(), db, "aggregate")
+	lastAssetProbe, _ := latestSampleTime(context.Background(), db, "asset")
+	if lastAssetProbe.IsZero() {
+		lastAssetProbe = time.Now().Add(-30 * time.Second)
+	}
+	if _, err := setting(context.Background(), db, "asset_targets"); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			db.Close()
+			return nil, err
+		}
+		if err = setSetting(context.Background(), db, "asset_targets", cfg.AssetTargets); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
 	return &App{
-		cfg: cfg, db: db, logger: logger, startedAt: time.Now(), sessions: newSessionStore(), exportJobs: make(chan exportJob, 16), loginLimiter: newLoginLimiter(), lastTransfer: lastTransfer, lastPersist: lastPersist, incidentStates: make(map[string]*incidentState),
+		cfg: cfg, db: db, logger: logger, startedAt: time.Now(), sessions: newSessionStore(), exportJobs: make(chan exportJob, 16), loginLimiter: newLoginLimiter(), lastTransfer: lastTransfer, lastAssetProbe: lastAssetProbe, lastPersist: lastPersist, incidentStates: make(map[string]*incidentState),
 	}, nil
 }
 
@@ -117,8 +135,75 @@ func (a *App) Close() error { return a.db.Close() }
 
 func (a *App) Start(ctx context.Context) {
 	go a.scheduler(ctx)
+	go a.assetScheduler(ctx)
 	go a.maintenance(ctx)
 	go a.exportWorker(ctx)
+}
+
+func (a *App) assetScheduler(ctx context.Context) {
+	wait := time.Until(a.lastAssetProbe.Add(30 * time.Second))
+	if wait < 0 {
+		wait = 0
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+	}
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	a.runAssetProbeCycle(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.runAssetProbeCycle(ctx)
+		}
+	}
+}
+
+func (a *App) runAssetProbeCycle(ctx context.Context) {
+	a.assetMu.Lock()
+	defer a.assetMu.Unlock()
+	configured, err := setting(ctx, a.db, "asset_targets")
+	if err != nil {
+		a.logger.Error("asset probe configuration unavailable", "error", err)
+		return
+	}
+	targets, err := parseAssetTargets(configured)
+	if err != nil {
+		a.logger.Error("asset probe configuration invalid", "error", err)
+		return
+	}
+	probes := make([]probeFunc, 0, len(targets))
+	for _, target := range targets {
+		target := target
+		probes = append(probes, probeFunc{ProbeType: "asset", Target: assetSampleTarget(target), Run: func(probeCtx context.Context) Sample { return probeAsset(probeCtx, target, a.cfg.HTTPDNSAddr) }})
+	}
+	samples := runConcurrentProbes(ctx, assetProbeTimeout(), probes)
+	if ctx.Err() != nil {
+		return
+	}
+	issues := make([]Sample, 0, len(samples))
+	observed := make(map[string]bool, len(samples))
+	for _, sample := range samples {
+		if err := insertSample(ctx, a.db, sample); err != nil {
+			a.logger.Error("asset sample persistence failed", "error", err)
+		}
+		name := assetSampleName(sample.Target)
+		category := assetIncidentCategory(name)
+		observed[category] = true
+		if sample.Severity != Info {
+			issue := incidentSample(sample, category)
+			issue.Message = name + " asset path degraded: " + sample.Message
+			issues = append(issues, issue)
+		}
+	}
+	a.updateIncidents(ctx, issues, observed)
+	a.lastAssetProbe = time.Now()
 }
 
 func (a *App) scheduler(ctx context.Context) {
@@ -217,7 +302,6 @@ func (a *App) runProbeCycle(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
-
 	profile, err := setting(ctx, a.db, "profile")
 	if err != nil {
 		profile = "low"
@@ -279,7 +363,7 @@ func (a *App) diagnoseSamples(samples []Sample) (Sample, []Sample, map[string]bo
 		"local_dns": hasPiHole && hasPiHoleUDP, "external_dns": hasPiHole && hasPiHoleUDP && hasPublic && hasDoH,
 		"pihole_udp_path": hasPiHoleUDP, "pihole_tcp_path": hasPiHole,
 		"direct_udp_path": hasPublic && hasDoH, "direct_doh_path": hasPublic && hasDoH,
-		"tcp_connect": hasTCP, "internet_outage": hasPiHole && hasPublic && hasDoH && hasTCP,
+		"tcp_connect": hasTCP, "internet_outage": hasPiHole && hasPiHoleUDP && hasPublic && hasDoH && hasTCP,
 		"slow_ttfb": hasHTTP, "tls_handshake": hasHTTP, "internet_connectivity": hasHTTP,
 		"slow_transfer": hasTransfer,
 	}
@@ -361,6 +445,8 @@ func (a *App) updateIncident(ctx context.Context, sample Sample) {
 }
 
 func (a *App) updateIncidents(ctx context.Context, issues []Sample, observed map[string]bool) {
+	a.incidentMu.Lock()
+	defer a.incidentMu.Unlock()
 	activeList, err := activeIncidents(ctx, a.db)
 	if err != nil {
 		a.logger.Error("incident lookup failed", "error", err)

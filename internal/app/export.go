@@ -197,11 +197,18 @@ func (a *App) writeExport(ctx context.Context, zw *zip.Writer, from, to time.Tim
 	}
 	var profile string
 	_ = tx.QueryRowContext(ctx, `SELECT value FROM settings WHERE key='profile'`).Scan(&profile)
+	var assetTargetSetting string
+	_ = tx.QueryRowContext(ctx, `SELECT value FROM settings WHERE key='asset_targets'`).Scan(&assetTargetSetting)
+	assetTargets, _ := parseAssetTargets(assetTargetSetting)
+	redactedAssetTargets := make([]map[string]string, 0, len(assetTargets))
+	for _, target := range assetTargets {
+		redactedAssetTargets = append(redactedAssetTargets, map[string]string{"name": target.Name, "url": redactURL(target.URL)})
+	}
 	availability := 100.0
 	if total > 0 {
 		availability = float64(successful) * 100 / float64(total)
 	}
-	summary := fmt.Sprintf("# Stormwarden Diagnostic Report\n\nObservation period: %s to %s\nGenerated: %s\nTraffic profile: %s\n\n## Summary\n\n- Health cycles: %d\n- Availability: %.2f%%\n- Warning cycles: %d\n- Error cycles: %d\n- Critical cycles: %d\n- Incidents: %d\n\n## Interpretation\n\nCompare observed behavior across Pi-hole TCP, Pi-hole UDP, direct DNS-over-UDP, and direct DNS-over-HTTPS paths. Queries use randomized subdomains to bypass caches; path differences are evidence, not proof of a specific underlying transport cause. HTTP records split DNS, TCP connect, TLS, time-to-first-byte, body transfer speed, and total duration. Aggregate records represent household connectivity per probe cycle.\n\n## Privacy\n\nAuthentication secrets, sessions, cookies, headers, and DNS answers are excluded. Configured targets remain because diagnosis requires them.\n", from.In(a.cfg.Timezone).Format(time.RFC3339), to.In(a.cfg.Timezone).Format(time.RFC3339), time.Now().In(a.cfg.Timezone).Format(time.RFC3339), profile, total, availability, warnings, errorCount, criticals, incidentCount)
+	summary := fmt.Sprintf("# Stormwarden Diagnostic Report\n\nObservation period: %s to %s\nGenerated: %s\nTraffic profile: %s\nAsset probes: %d\n\n## Summary\n\n- Health cycles: %d\n- Availability: %.2f%%\n- Warning cycles: %d\n- Error cycles: %d\n- Critical cycles: %d\n- Incidents: %d\n\n## Interpretation\n\nCompare observed behavior across Pi-hole TCP, Pi-hole UDP, direct DNS-over-UDP, direct DNS-over-HTTPS, and configured asset paths. Queries use randomized subdomains to bypass caches; path differences are evidence, not proof of a specific underlying transport cause. HTTP and asset records split DNS, TCP connect, TLS, time-to-first-byte, body transfer speed, and total duration. Aggregate records represent household connectivity per probe cycle.\n\n## Privacy\n\nAuthentication secrets, sessions, cookies, headers, and DNS answers are excluded. Configured targets remain because diagnosis requires them; URL credentials, queries, and fragments are removed.\n", from.In(a.cfg.Timezone).Format(time.RFC3339), to.In(a.cfg.Timezone).Format(time.RFC3339), time.Now().In(a.cfg.Timezone).Format(time.RFC3339), profile, len(assetTargets), total, availability, warnings, errorCount, criticals, incidentCount)
 	if err := zipText(zw, "README.md", "Use summary.md for an overview and the JSONL files for detailed analysis. JSONL contains one JSON object per line. Raw data retains 30 days; rollups preserve older trends.\n"); err != nil {
 		return err
 	}
@@ -224,7 +231,7 @@ func (a *App) writeExport(ctx context.Context, zw *zip.Writer, from, to time.Tim
 	if err := a.zipRollups(ctx, tx, zw, "quarter_hour_rollups_v2", "quarter-hour-rollups.jsonl", fromText, toText); err != nil {
 		return err
 	}
-	settings := map[string]any{"profile": profile, "pihole_dns_target": a.cfg.PiHoleAddr, "public_dns_target": a.cfg.PublicDNS, "doh_probe_url": redactURL(a.cfg.DoHURL), "http_dns_target": a.cfg.HTTPDNSAddr, "http_probe_url": redactURL(a.cfg.HTTPURL), "http_expected_status": a.cfg.HTTPExpectedStatus, "transfer_probe_url": redactURL(a.cfg.TransferURL), "raw_retention_days": 30, "rollup_retention": "indefinite", "export_retention_days": 7}
+	settings := map[string]any{"profile": profile, "asset_targets": redactedAssetTargets, "pihole_dns_target": a.cfg.PiHoleAddr, "public_dns_target": a.cfg.PublicDNS, "doh_probe_url": redactURL(a.cfg.DoHURL), "http_dns_target": a.cfg.HTTPDNSAddr, "http_probe_url": redactURL(a.cfg.HTTPURL), "http_expected_status": a.cfg.HTTPExpectedStatus, "transfer_probe_url": redactURL(a.cfg.TransferURL), "raw_retention_days": 30, "rollup_retention": "indefinite", "export_retention_days": 7}
 	if err := zipJSON(zw, "settings-redacted.json", settings); err != nil {
 		return err
 	}

@@ -14,6 +14,7 @@ services:
       HTTP_DNS_ADDR: ${HTTP_DNS_ADDR:-${PIHOLE_DNS_ADDR}}
       HTTP_PROBE_URL: ${HTTP_PROBE_URL:-https://www.google.com/generate_204}
       TRANSFER_PROBE_URL: ${TRANSFER_PROBE_URL:-https://speed.cloudflare.com/__down?bytes=262144}
+      ASSET_PROBES: ${ASSET_PROBES:-YouTube thumbnail|https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg}
       APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Budapest}
       APP_COOKIE_SECURE: ${APP_COOKIE_SECURE:-false}
       APP_LISTEN_ADDR: :8080

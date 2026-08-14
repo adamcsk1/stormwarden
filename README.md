@@ -9,6 +9,7 @@ Dockerized Go service for recording intermittent DNS and internet performance pr
 - Independent TCP internet connectivity
 - HTTP DNS, connect, TLS, time-to-first-byte, total duration, and status
 - Optional bounded transfer-speed test
+- Configurable representative-image loads every 30 seconds, capped at 512 KiB each
 - Correlated warning, error, and critical incidents
 
 Probe traffic profiles are selectable in UI:
@@ -18,6 +19,8 @@ Probe traffic profiles are selectable in UI:
 | Minimal | Disabled | Very low |
 | Low | 256 KiB every 15 minutes | About 0.75 GB/month |
 | Detailed | 5 MiB every 15 minutes | About 15 GB/month |
+
+Asset traffic is separate from the selected profile. Configure up to eight stable public image URLs in Probe settings using one `Name|URL` entry per line. Each target runs every 30 seconds and stops after 512 KiB, so choose small representative images; 100 KiB per response is about 8.6 GB/month per target, while the 512 KiB cap is about 45 GB/month per target.
 
 ## Run
 
@@ -49,6 +52,7 @@ For HTTPS behind reverse proxy, set `APP_COOKIE_SECURE=true`. Do not expose plai
 | `HTTP_DNS_ADDR` | `PIHOLE_DNS_ADDR` | Explicit resolver used by HTTP probes |
 | `HTTP_EXPECTED_STATUS` | `204` | Required probe response; use `0` for any 2xx/3xx |
 | `TRANSFER_PROBE_URL` | Cloudflare speed endpoint | Bounded transfer target |
+| `ASSET_PROBES` | YouTube thumbnail | Initial asset targets, as `Name|URL` entries separated by semicolons |
 | `APP_TIMEZONE` | `Europe/Budapest` | Display timezone |
 | `APP_COOKIE_SECURE` | `false` | Require HTTPS session cookies |
 | `APP_PORT` | `8080` | Host port published by Docker Compose |
@@ -64,6 +68,8 @@ Dashboard generates last-day or last-week ZIP reports. Each report contains:
 - `incidents.jsonl`: correlated problem log
 - `settings-redacted.json`: diagnostic configuration without secrets
 - `system-info.json`: runtime context
+
+Raw asset measurements and rollups are included. `settings-redacted.json` lists configured asset names and URLs without credentials, query strings, or fragments.
 
 Generated reports run through one background worker and expire after 7 days. Raw measurements retain 30 days; compact 15-minute, hourly, and daily rollups plus incident history remain available. Reports support day, week, month, custom, and all-history ranges. Cleanup runs daily.
 
