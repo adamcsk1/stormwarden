@@ -7,16 +7,29 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
 	"strings"
 	"time"
+
+	"golang.org/x/net/dns/dnsmessage"
 )
+
+const maxDNSMessageSize = 65535
+
+var sharedDoHClient = &http.Client{Transport: &http.Transport{
+	MaxIdleConns:        4,
+	MaxIdleConnsPerHost: 2,
+	IdleConnTimeout:     90 * time.Second,
+	TLSHandshakeTimeout: 4 * time.Second,
+}}
 
 func probeTCP(ctx context.Context, name, address string) Sample {
 	started := time.Now()
@@ -37,19 +50,12 @@ func probeTCP(ctx context.Context, name, address string) Sample {
 func probeDNS(ctx context.Context, target, address string) Sample {
 	started := time.Now()
 	s := Sample{CreatedAt: started, ProbeType: "dns", Target: target, Severity: Info}
-	idBytes := make([]byte, 2)
-	if _, err := rand.Read(idBytes); err != nil {
+	id, query, err := newDNSQuery()
+	if err != nil {
 		s.Severity, s.Message = Error, err.Error()
 		return s
 	}
-	id := binary.BigEndian.Uint16(idBytes)
-	query := dnsQuery(id, "example.com")
 	response, err := exchangeDNS(ctx, "udp", address, query)
-	transport := "udp"
-	if err == nil && len(response) >= 4 && response[2]&0x02 != 0 {
-		response, err = exchangeDNS(ctx, "tcp", address, query)
-		transport = "tcp"
-	}
 	if err != nil {
 		s.DurationMS = ms(time.Since(started))
 		s.Severity, s.Message = Error, err.Error()
@@ -63,7 +69,7 @@ func probeDNS(ctx context.Context, target, address string) Sample {
 	s.Success = true
 	s.Severity, s.Message = classifyLatency(s.DurationMS, "DNS response")
 	if s.Severity == Info {
-		s.Message = "healthy over " + transport
+		s.Message = dnsSuccessMessage(response, "udp")
 	}
 	return s
 }
@@ -71,13 +77,11 @@ func probeDNS(ctx context.Context, target, address string) Sample {
 func probeDNSTCP(ctx context.Context, target, address string) Sample {
 	started := time.Now()
 	s := Sample{CreatedAt: started, ProbeType: "dns", Target: target, Severity: Info}
-	idBytes := make([]byte, 2)
-	if _, err := rand.Read(idBytes); err != nil {
+	id, query, err := newDNSQuery()
+	if err != nil {
 		s.Severity, s.Message = Error, err.Error()
 		return s
 	}
-	id := binary.BigEndian.Uint16(idBytes)
-	query := dnsQuery(id, "example.com")
 	response, err := exchangeDNS(ctx, "tcp", address, query)
 	s.DurationMS, s.DNSMS = ms(time.Since(started)), ms(time.Since(started))
 	if err != nil {
@@ -91,7 +95,86 @@ func probeDNSTCP(ctx context.Context, target, address string) Sample {
 	s.Success = true
 	s.Severity, s.Message = classifyLatency(s.DurationMS, "DNS response")
 	if s.Severity == Info {
-		s.Message = "healthy over tcp"
+		s.Message = dnsSuccessMessage(response, "tcp")
+	}
+	return s
+}
+
+func probeDoH(ctx context.Context, target, endpoint string) Sample {
+	started := time.Now()
+	s := Sample{CreatedAt: started, ProbeType: "doh", Target: target, Severity: Info}
+	id, query, err := newDNSQuery()
+	if err != nil {
+		s.Severity, s.Message = Error, err.Error()
+		return s
+	}
+	var connectStart, tlsStart, wroteRequest time.Time
+	trace := &httptrace.ClientTrace{
+		ConnectStart: func(_, _ string) { connectStart = time.Now() },
+		ConnectDone: func(_, _ string, _ error) {
+			if !connectStart.IsZero() {
+				s.ConnectMS = ms(time.Since(connectStart))
+			}
+		},
+		TLSHandshakeStart: func() { tlsStart = time.Now() },
+		TLSHandshakeDone: func(tls.ConnectionState, error) {
+			if !tlsStart.IsZero() {
+				s.TLSMS = ms(time.Since(tlsStart))
+			}
+		},
+		WroteRequest: func(httptrace.WroteRequestInfo) { wroteRequest = time.Now() },
+		GotFirstResponseByte: func() {
+			if wroteRequest.IsZero() {
+				s.TTFBMS = ms(time.Since(started))
+			} else {
+				s.TTFBMS = ms(time.Since(wroteRequest))
+			}
+		},
+	}
+	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), http.MethodPost, endpoint, bytes.NewReader(query))
+	if err != nil {
+		s.Severity, s.Message = Error, redactHTTPError(err, endpoint)
+		return s
+	}
+	req.Header.Set("Accept", "application/dns-message")
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("User-Agent", "stormwarden/1.0")
+	resp, err := sharedDoHClient.Do(req)
+	if err != nil {
+		s.DurationMS = ms(time.Since(started))
+		s.Severity, s.Message = Error, redactHTTPError(err, endpoint)
+		return s
+	}
+	defer resp.Body.Close()
+	s.DurationMS, s.DNSMS = ms(time.Since(started)), ms(time.Since(started))
+	s.StatusCode = resp.StatusCode
+	if resp.StatusCode != http.StatusOK {
+		s.Severity, s.Message = Error, fmt.Sprintf("unexpected DoH status %d", resp.StatusCode)
+		return s
+	}
+	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/dns-message" {
+		s.Severity, s.Message = Error, "invalid DoH content type"
+		return s
+	}
+	response, err := io.ReadAll(io.LimitReader(resp.Body, maxDNSMessageSize+1))
+	s.DurationMS, s.DNSMS = ms(time.Since(started)), ms(time.Since(started))
+	if err != nil {
+		s.Severity, s.Message = Error, err.Error()
+		return s
+	}
+	if len(response) > maxDNSMessageSize {
+		s.Severity, s.Message = Error, "oversized DoH response"
+		return s
+	}
+	if err := validateDNSResponse(response, query, id); err != nil {
+		s.Severity, s.Message = Error, err.Error()
+		return s
+	}
+	s.Success = true
+	s.Severity, s.Message = classifyLatency(s.DurationMS, "DoH response")
+	if s.Severity == Info {
+		s.Message = dnsSuccessMessage(response, "doh")
 	}
 	return s
 }
@@ -132,58 +215,66 @@ func exchangeDNS(ctx context.Context, network, address string, query []byte) ([]
 }
 
 func validateDNSResponse(response, query []byte, id uint16) error {
-	questionLength := len(query) - 12
-	if len(response) < 12+questionLength {
-		return errors.New("short DNS response")
+	var queryMessage, responseMessage dnsmessage.Message
+	if err := queryMessage.Unpack(query); err != nil {
+		return fmt.Errorf("invalid DNS query: %w", err)
 	}
-	if binary.BigEndian.Uint16(response[:2]) != id {
-		return errors.New("DNS response ID mismatch")
+	if err := responseMessage.Unpack(response); err != nil {
+		return fmt.Errorf("invalid DNS response: %w", err)
 	}
-	if response[2]&0x80 == 0 || response[2]&0x78 != 0 {
+	if !responseMessage.Header.Response || responseMessage.Header.OpCode != 0 {
 		return errors.New("invalid DNS response flags")
 	}
-	if response[3]&0x0f != 0 {
-		return fmt.Errorf("DNS response code %d", response[3]&0x0f)
+	if responseMessage.Header.ID != id {
+		return errors.New("DNS response ID mismatch")
 	}
-	if binary.BigEndian.Uint16(response[4:6]) != 1 || binary.BigEndian.Uint16(response[6:8]) == 0 {
-		return errors.New("DNS response has no answer")
+	if responseMessage.Header.Truncated {
+		return errors.New("DNS response was truncated")
 	}
-	if !bytes.Equal(response[12:12+questionLength], query[12:]) {
+	if !responseMessage.Header.RecursionAvailable {
+		return errors.New("DNS recursion unavailable")
+	}
+	if len(queryMessage.Questions) != 1 || len(responseMessage.Questions) != 1 {
+		return errors.New("DNS response question count mismatch")
+	}
+	want, got := queryMessage.Questions[0], responseMessage.Questions[0]
+	if want.Name.String() != got.Name.String() || want.Type != got.Type || want.Class != got.Class {
 		return errors.New("DNS response question mismatch")
 	}
-	if !validDNSAnswer(response, 12+questionLength) {
-		return errors.New("malformed DNS answer")
+	if responseMessage.Header.RCode != dnsmessage.RCodeSuccess && responseMessage.Header.RCode != dnsmessage.RCodeNameError {
+		return fmt.Errorf("DNS response code %d", responseMessage.Header.RCode)
 	}
-	return nil
-}
-
-func validDNSAnswer(response []byte, offset int) bool {
-	if offset >= len(response) {
-		return false
+	if len(responseMessage.Answers) > 0 {
+		return nil
 	}
-	if response[offset]&0xc0 == 0xc0 {
-		offset += 2
-	} else {
-		for {
-			if offset >= len(response) {
-				return false
+	for _, authority := range responseMessage.Authorities {
+		if authority.Header.Type == dnsmessage.TypeSOA {
+			if _, ok := authority.Body.(*dnsmessage.SOAResource); ok {
+				return nil
 			}
-			length := int(response[offset])
-			offset++
-			if length == 0 {
-				break
-			}
-			if length > 63 || offset+length > len(response) {
-				return false
-			}
-			offset += length
 		}
 	}
-	if offset+10 > len(response) {
-		return false
+	return errors.New("DNS negative response lacks SOA authority")
+}
+
+func newDNSQuery() (uint16, []byte, error) {
+	random := make([]byte, 10)
+	if _, err := rand.Read(random); err != nil {
+		return 0, nil, err
 	}
-	rdLength := int(binary.BigEndian.Uint16(response[offset+8 : offset+10]))
-	return offset+10+rdLength <= len(response)
+	id := binary.BigEndian.Uint16(random[:2])
+	domain := hex.EncodeToString(random[2:]) + ".example.com"
+	return id, dnsQuery(id, domain), nil
+}
+
+func dnsSuccessMessage(response []byte, transport string) string {
+	if len(response) >= 4 && response[3]&0x0f == 3 {
+		return "healthy uncached NXDOMAIN over " + transport
+	}
+	if len(response) >= 8 && binary.BigEndian.Uint16(response[6:8]) == 0 {
+		return "healthy uncached NODATA over " + transport
+	}
+	return "healthy uncached answer over " + transport
 }
 
 func dnsQuery(id uint16, domain string) []byte {
@@ -247,8 +338,13 @@ func probeHTTPStatusResolver(ctx context.Context, probeType, url string, limit i
 	req.Header.Set("User-Agent", "stormwarden/1.0")
 	dialer := &net.Dialer{}
 	if dnsAddress != "" {
-		dialer.Resolver = &net.Resolver{PreferGo: true, Dial: func(resolveCtx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(resolveCtx, "tcp", dnsAddress)
+		dialer.Resolver = &net.Resolver{PreferGo: true, Dial: func(resolveCtx context.Context, network, _ string) (net.Conn, error) {
+			if strings.HasPrefix(network, "udp") {
+				network = "udp"
+			} else {
+				network = "tcp"
+			}
+			return (&net.Dialer{}).DialContext(resolveCtx, network, dnsAddress)
 		}}
 	}
 	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true, TLSHandshakeTimeout: 4 * time.Second, DialContext: dialer.DialContext}}

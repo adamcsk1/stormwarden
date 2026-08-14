@@ -14,6 +14,7 @@ type Config struct {
 	ExportDir          string
 	PiHoleAddr         string
 	PublicDNS          string
+	DoHURL             string
 	HTTPURL            string
 	HTTPDNSAddr        string
 	TransferURL        string
@@ -47,6 +48,7 @@ func LoadConfig() (Config, error) {
 		ExportDir:          env("EXPORT_DIR", "data/exports"),
 		PiHoleAddr:         piholeAddr,
 		PublicDNS:          env("PUBLIC_DNS_ADDR", "1.1.1.1:53"),
+		DoHURL:             env("DOH_PROBE_URL", "https://1.1.1.1/dns-query"),
 		HTTPURL:            env("HTTP_PROBE_URL", "https://www.google.com/generate_204"),
 		HTTPDNSAddr:        env("HTTP_DNS_ADDR", piholeAddr),
 		TransferURL:        env("TRANSFER_PROBE_URL", "https://speed.cloudflare.com/__down?bytes=262144"),

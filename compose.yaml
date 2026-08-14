@@ -10,6 +10,7 @@ services:
       APP_PASSWORD: ${APP_PASSWORD:?set APP_PASSWORD in .env}
       PIHOLE_DNS_ADDR: ${PIHOLE_DNS_ADDR:?set PIHOLE_DNS_ADDR in .env}
       PUBLIC_DNS_ADDR: ${PUBLIC_DNS_ADDR:-1.1.1.1:53}
+      DOH_PROBE_URL: ${DOH_PROBE_URL:-https://1.1.1.1/dns-query}
       HTTP_DNS_ADDR: ${HTTP_DNS_ADDR:-${PIHOLE_DNS_ADDR}}
       HTTP_PROBE_URL: ${HTTP_PROBE_URL:-https://www.google.com/generate_204}
       TRANSFER_PROBE_URL: ${TRANSFER_PROBE_URL:-https://speed.cloudflare.com/__down?bytes=262144}

@@ -1,0 +1,52 @@
+.full {
+  grid-column: 1 / -1;
+}
+
+.dns-path-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.dns-path {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 7px 10px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #0b1714;
+}
+
+.dns-path > span:first-child,
+.dns-path small {
+  color: var(--muted);
+}
+
+.dns-path strong {
+  font-size: 1.1rem;
+}
+
+.dns-path .badge {
+  align-self: start;
+}
+
+.dns-path small {
+  grid-column: 1 / -1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 850px) {
+  .dns-path-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 480px) {
+  .dns-path-grid {
+    grid-template-columns: 1fr;
+  }
+}

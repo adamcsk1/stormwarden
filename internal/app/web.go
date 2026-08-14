@@ -148,6 +148,7 @@ func (a *App) routes() http.Handler {
 	mux.Handle("POST /logout", a.requireAuth(http.HandlerFunc(a.logout)))
 	mux.Handle("GET /ui/summary", a.requireAuth(http.HandlerFunc(a.summaryFragment)))
 	mux.Handle("GET /ui/metrics", a.requireAuth(http.HandlerFunc(a.metricsFragment)))
+	mux.Handle("GET /ui/dns-paths", a.requireAuth(http.HandlerFunc(a.dnsPathsFragment)))
 	mux.Handle("GET /ui/incidents", a.requireAuth(http.HandlerFunc(a.incidentsFragment)))
 	mux.Handle("GET /ui/settings", a.requireAuth(http.HandlerFunc(a.settingsFragment)))
 	mux.Handle("POST /ui/settings", a.requireAuth(http.HandlerFunc(a.saveSettings)))
@@ -313,6 +314,31 @@ func (a *App) metricsFragment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.render(w, "metrics.html", map[string]any{"Samples": samples})
+}
+
+type dnsPathView struct {
+	Label  string
+	Sample *Sample
+	Stale  bool
+}
+
+func (a *App) dnsPathsFragment(w http.ResponseWriter, r *http.Request) {
+	definitions := []struct{ target, label string }{
+		{"pihole", "Pi-hole TCP"},
+		{"pihole-udp", "Pi-hole UDP"},
+		{"public-dns", "Direct UDP"},
+		{"direct-doh", "Direct DoH"},
+	}
+	paths := make([]dnsPathView, 0, len(definitions))
+	for _, definition := range definitions {
+		sample, err := latestSampleByTarget(r.Context(), a.db, definition.target)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		paths = append(paths, dnsPathView{Label: definition.label, Sample: sample, Stale: sample != nil && time.Since(sample.CreatedAt) > 45*time.Second})
+	}
+	a.render(w, "dns-paths.html", map[string]any{"Paths": paths})
 }
 
 func (a *App) incidentsFragment(w http.ResponseWriter, r *http.Request) {
