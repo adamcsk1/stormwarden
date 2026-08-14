@@ -15,6 +15,7 @@ type Config struct {
 	PiHoleAddr         string
 	PublicDNS          string
 	HTTPURL            string
+	HTTPDNSAddr        string
 	TransferURL        string
 	HTTPExpectedStatus int
 	Timezone           *time.Location
@@ -38,14 +39,16 @@ func LoadConfig() (Config, error) {
 	if err != nil || expectedStatus < 0 || expectedStatus > 599 || (expectedStatus > 0 && expectedStatus < 100) {
 		return Config{}, errors.New("HTTP_EXPECTED_STATUS must be 0 or a valid HTTP status")
 	}
+	piholeAddr := env("PIHOLE_DNS_ADDR", "127.0.0.1:53")
 	return Config{
 		ListenAddr:         env("APP_LISTEN_ADDR", ":8080"),
 		Password:           password,
 		DataPath:           env("DATA_PATH", "data/stormwarden.db"),
 		ExportDir:          env("EXPORT_DIR", "data/exports"),
-		PiHoleAddr:         env("PIHOLE_DNS_ADDR", "127.0.0.1:53"),
+		PiHoleAddr:         piholeAddr,
 		PublicDNS:          env("PUBLIC_DNS_ADDR", "1.1.1.1:53"),
 		HTTPURL:            env("HTTP_PROBE_URL", "https://www.google.com/generate_204"),
+		HTTPDNSAddr:        env("HTTP_DNS_ADDR", piholeAddr),
 		TransferURL:        env("TRANSFER_PROBE_URL", "https://speed.cloudflare.com/__down?bytes=262144"),
 		HTTPExpectedStatus: expectedStatus,
 		Timezone:           location,

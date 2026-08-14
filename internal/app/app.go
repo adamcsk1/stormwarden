@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -19,10 +20,12 @@ type App struct {
 	sessions       *sessionStore
 	probeMu        sync.Mutex
 	dataMu         sync.RWMutex
+	healthMu       sync.RWMutex
+	lastPersist    time.Time
+	lastPersistErr error
 	lastTransfer   time.Time
-	badCycles      int
-	healthyCycles  int
 	criticalCycles int
+	incidentStates map[string]*incidentState
 	exportJobs     chan exportJob
 	loginLimiter   *loginLimiter
 }
@@ -96,8 +99,17 @@ func New(cfg Config, logger *slog.Logger) (*App, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := applyPrivacyMigration(db, cfg.ExportDir); err != nil {
+		db.Close()
+		return nil, err
+	}
+	lastTransfer, _ := latestSampleTime(context.Background(), db, "transfer")
+	if lastTransfer.IsZero() {
+		lastTransfer = time.Now()
+	}
+	lastPersist, _ := latestSampleTime(context.Background(), db, "aggregate")
 	return &App{
-		cfg: cfg, db: db, logger: logger, startedAt: time.Now(), sessions: newSessionStore(), exportJobs: make(chan exportJob, 16), loginLimiter: newLoginLimiter(),
+		cfg: cfg, db: db, logger: logger, startedAt: time.Now(), sessions: newSessionStore(), exportJobs: make(chan exportJob, 16), loginLimiter: newLoginLimiter(), lastTransfer: lastTransfer, lastPersist: lastPersist, incidentStates: make(map[string]*incidentState),
 	}, nil
 }
 
@@ -149,7 +161,7 @@ func (a *App) runMaintenance(ctx context.Context) {
 
 func (a *App) cleanupExports() {
 	cutoff := time.Now().Add(-7 * 24 * time.Hour)
-	rows, err := a.db.Query(`SELECT id, path FROM exports WHERE created_at < ?`, cutoff.UTC().Format(time.RFC3339Nano))
+	rows, err := a.db.Query(`SELECT id, path FROM exports WHERE created_at < ?`, dbTime(cutoff))
 	if err != nil {
 		return
 	}
@@ -162,13 +174,28 @@ func (a *App) cleanupExports() {
 		}
 	}
 	_ = rows.Close()
+	cleanDir, err := filepath.Abs(a.cfg.ExportDir)
+	if err != nil {
+		a.logger.Error("export cleanup path failed", "error", err)
+		return
+	}
 	for _, item := range expired {
-		if filepath.Clean(item.path) != filepath.Clean(a.cfg.ExportDir) {
-			_ = os.Remove(item.path)
+		cleanPath, pathErr := filepath.Abs(item.path)
+		if pathErr != nil || !strings.HasPrefix(cleanPath, cleanDir+string(os.PathSeparator)) {
+			a.logger.Error("export cleanup rejected path", "path", item.path)
+			continue
 		}
-		_, _ = a.db.Exec(`DELETE FROM exports WHERE id=?`, item.id)
+		if removeErr := os.Remove(cleanPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			a.logger.Error("export cleanup file failed", "path", cleanPath, "error", removeErr)
+			continue
+		}
+		if _, deleteErr := a.db.Exec(`DELETE FROM exports WHERE id=?`, item.id); deleteErr != nil {
+			a.logger.Error("export cleanup record failed", "id", item.id, "error", deleteErr)
+		}
 	}
 }
+
+type incidentState struct{ badCycles, healthyCycles int }
 
 func (a *App) runProbeCycle(ctx context.Context) {
 	if !a.probeMu.TryLock() {
@@ -177,14 +204,18 @@ func (a *App) runProbeCycle(ctx context.Context) {
 	defer a.probeMu.Unlock()
 
 	probes := []probeFunc{
-		{ProbeType: "dns", Target: "pihole", Run: func(probeCtx context.Context) Sample { return probeDNS(probeCtx, "pihole", a.cfg.PiHoleAddr) }},
+		{ProbeType: "dns", Target: "pihole", Run: func(probeCtx context.Context) Sample { return probeDNSTCP(probeCtx, "pihole", a.cfg.PiHoleAddr) }},
+		{ProbeType: "dns", Target: "pihole-udp", Run: func(probeCtx context.Context) Sample { return probeDNS(probeCtx, "pihole-udp", a.cfg.PiHoleAddr) }},
 		{ProbeType: "dns", Target: "public-dns", Run: func(probeCtx context.Context) Sample { return probeDNS(probeCtx, "public-dns", a.cfg.PublicDNS) }},
 		{ProbeType: "tcp", Target: "internet-tcp", Run: func(probeCtx context.Context) Sample { return probeTCP(probeCtx, "internet-tcp", "1.1.1.1:443") }},
 		{ProbeType: "http", Target: "http", Run: func(probeCtx context.Context) Sample {
-			return probeHTTPStatus(probeCtx, "http", a.cfg.HTTPURL, 64*1024, a.cfg.HTTPExpectedStatus)
+			return probeHTTPStatusResolver(probeCtx, "http", a.cfg.HTTPURL, 512, a.cfg.HTTPExpectedStatus, a.cfg.HTTPDNSAddr)
 		}},
 	}
 	samples := runConcurrentProbes(ctx, 10*time.Second, probes)
+	if ctx.Err() != nil {
+		return
+	}
 
 	profile, err := setting(ctx, a.db, "profile")
 	if err != nil {
@@ -193,8 +224,8 @@ func (a *App) runProbeCycle(ctx context.Context) {
 	interval := profileTransferInterval(profile)
 	if interval > 0 && time.Since(a.lastTransfer) >= interval {
 		limit := profileTransferBytes(profile)
-		transferCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		samples = append(samples, probeHTTPStatus(transferCtx, "transfer", transferURL(a.cfg.TransferURL, limit), limit, http.StatusOK))
+		transferCtx, cancel := context.WithTimeout(ctx, transferProbeTimeout(limit))
+		samples = append(samples, probeHTTPStatusResolver(transferCtx, "transfer", transferURL(a.cfg.TransferURL, limit), limit, http.StatusOK, a.cfg.HTTPDNSAddr))
 		cancel()
 		a.lastTransfer = time.Now()
 	}
@@ -204,82 +235,163 @@ func (a *App) runProbeCycle(ctx context.Context) {
 			a.logger.Error("sample persistence failed", "error", err)
 		}
 	}
-	aggregate := a.aggregateSample(samples)
+	aggregate, issues, observed := a.diagnoseSamples(samples)
 	if err := insertSample(ctx, a.db, aggregate); err != nil {
 		a.logger.Error("aggregate persistence failed", "error", err)
+		a.healthMu.Lock()
+		a.lastPersistErr = err
+		a.healthMu.Unlock()
+	} else {
+		a.healthMu.Lock()
+		a.lastPersist, a.lastPersistErr = time.Now(), nil
+		a.healthMu.Unlock()
 	}
-	a.updateIncident(ctx, aggregate)
+	a.updateIncidents(ctx, issues, observed)
 }
 
 func (a *App) aggregateSample(samples []Sample) Sample {
+	aggregate, _, _ := a.diagnoseSamples(samples)
+	return aggregate
+}
+
+func (a *App) diagnoseSamples(samples []Sample) (Sample, []Sample, map[string]bool) {
 	aggregate := Sample{CreatedAt: time.Now(), ProbeType: "aggregate", Target: "internet", Severity: Info, Success: true, Message: "healthy"}
-	var worst Sample
-	relevantFailures, relevantDegraded, independentFailures := 0, 0, 0
+	byTarget := make(map[string]Sample)
+	var httpSample, transfer Sample
+	hasHTTP, hasTransfer := false, false
 	for _, sample := range samples {
+		byTarget[sample.Target] = sample
+		if sample.ProbeType == "http" {
+			httpSample, hasHTTP = sample, true
+		}
 		if sample.ProbeType == "transfer" {
-			continue
-		}
-		if !sample.Success {
-			independentFailures++
-		}
-		relevant := sample.Target != "public-dns"
-		if relevant && !sample.Success {
-			relevantFailures++
-		}
-		if relevant && sample.Severity != Info {
-			relevantDegraded++
-		}
-		if relevant && severityRank(sample.Severity) > severityRank(worst.Severity) {
-			worst = sample
+			transfer, hasTransfer = sample, true
 		}
 	}
-	if independentFailures >= 3 {
+	pihole, hasPiHole := byTarget["pihole"]
+	piholeUDP, hasPiHoleUDP := byTarget["pihole-udp"]
+	publicDNS, hasPublic := byTarget["public-dns"]
+	tcp, hasTCP := byTarget["internet-tcp"]
+	var issues []Sample
+	observed := map[string]bool{
+		"local_dns": hasPiHole, "external_dns": hasPiHole && hasPublic, "udp_dns": hasPiHoleUDP,
+		"tcp_connect": hasTCP, "internet_outage": hasPiHole && hasPublic && hasTCP,
+		"slow_ttfb": hasHTTP, "tls_handshake": hasHTTP, "internet_connectivity": hasHTTP,
+		"slow_transfer": hasTransfer,
+	}
+	if hasPiHole && pihole.Severity != Info {
+		category := "local_dns"
+		if hasPublic && !publicDNS.Success {
+			category = "external_dns"
+		}
+		issues = append(issues, incidentSample(pihole, category))
+	}
+	if hasPiHoleUDP && piholeUDP.Severity != Info {
+		issues = append(issues, incidentSample(piholeUDP, "udp_dns"))
+	}
+	if hasTCP && tcp.Severity != Info {
+		issues = append(issues, incidentSample(tcp, "tcp_connect"))
+	}
+	if hasHTTP && httpSample.Severity != Info && (!hasPiHole || pihole.Success) && (!hasTCP || tcp.Success) {
+		issues = append(issues, incidentSample(httpSample, categoryFor(httpSample)))
+	}
+	if hasTransfer && transfer.Severity != Info {
+		issues = append(issues, incidentSample(transfer, "slow_transfer"))
+	}
+	outageEvidence := hasPiHole && hasPublic && hasTCP && !pihole.Success && !publicDNS.Success && !tcp.Success
+	if outageEvidence {
 		a.criticalCycles++
 	} else {
 		a.criticalCycles = 0
 	}
-	if relevantDegraded == 0 {
-		return aggregate
-	}
-	aggregate.Success = relevantFailures == 0
-	aggregate.Severity, aggregate.Message, aggregate.Target = worst.Severity, worst.Message, categoryFor(worst)
 	if a.criticalCycles >= 2 {
-		aggregate.Severity, aggregate.Target, aggregate.Message = Critical, "internet_outage", "multiple independent probes failed for consecutive cycles"
+		critical := incidentSample(tcp, "internet_outage")
+		critical.Severity, critical.Message = Critical, "Pi-hole DNS, public DNS, and direct TCP failed for consecutive cycles"
+		issues = append(issues, critical)
 	}
-	return aggregate
+	available := (!hasPiHole || pihole.Success) && (!hasTCP || tcp.Success) && (!hasHTTP || httpSample.Success)
+	for _, issue := range issues {
+		if severityRank(issue.Severity) > severityRank(aggregate.Severity) {
+			aggregate = issue
+		}
+	}
+	aggregate.CreatedAt, aggregate.ProbeType, aggregate.Success = time.Now(), "aggregate", available
+	if len(issues) == 0 {
+		aggregate.Target, aggregate.Message = "internet", "healthy"
+	}
+	return aggregate, issues, observed
 }
 
-func (a *App) updateIncident(ctx context.Context, worst Sample) {
-	active, err := activeIncident(ctx, a.db)
+func incidentSample(source Sample, category string) Sample {
+	source.CreatedAt, source.ProbeType, source.Target = time.Now(), "aggregate", category
+	return source
+}
+
+func (a *App) updateIncident(ctx context.Context, sample Sample) {
+	if sample.Severity == Info {
+		observed := make(map[string]bool)
+		for category := range a.incidentStates {
+			observed[category] = true
+		}
+		a.updateIncidents(ctx, nil, observed)
+		return
+	}
+	a.updateIncidents(ctx, []Sample{sample}, map[string]bool{sample.Target: true})
+}
+
+func (a *App) updateIncidents(ctx context.Context, issues []Sample, observed map[string]bool) {
+	activeList, err := activeIncidents(ctx, a.db)
 	if err != nil {
 		a.logger.Error("incident lookup failed", "error", err)
 		return
 	}
-	if worst.Severity == Info {
-		a.badCycles = 0
-		a.healthyCycles++
-		if active != nil {
-			if a.healthyCycles >= 3 {
-				_ = closeIncident(ctx, a.db, active.ID)
+	active := make(map[string]Incident)
+	for _, incident := range activeList {
+		active[incident.Category] = incident
+		if a.incidentStates[incident.Category] == nil {
+			a.incidentStates[incident.Category] = &incidentState{}
+		}
+	}
+	current := make(map[string]Sample)
+	for _, issue := range issues {
+		current[issue.Target] = issue
+		if a.incidentStates[issue.Target] == nil {
+			a.incidentStates[issue.Target] = &incidentState{}
+		}
+	}
+	for category, state := range a.incidentStates {
+		issue, failing := current[category]
+		incident, isActive := active[category]
+		if !failing && !observed[category] {
+			continue
+		}
+		if !failing {
+			state.badCycles = 0
+			state.healthyCycles++
+			if isActive && state.healthyCycles >= 3 {
+				if err := closeIncident(ctx, a.db, incident.ID); err != nil {
+					a.logger.Error("incident close failed", "category", category, "error", err)
+				}
 			}
+			continue
 		}
-		return
-	}
-	a.healthyCycles = 0
-	a.badCycles++
-	if active == nil {
-		if a.badCycles < 2 {
-			return
+		state.healthyCycles = 0
+		state.badCycles++
+		if !isActive {
+			if state.badCycles >= 2 {
+				if err := openIncident(ctx, a.db, issue); err != nil {
+					a.logger.Error("incident creation failed", "category", category, "error", err)
+				}
+			}
+			continue
 		}
-		if err := openIncident(ctx, a.db, worst); err != nil {
-			a.logger.Error("incident creation failed", "error", err)
+		if severityRank(incident.Severity) > severityRank(issue.Severity) {
+			issue.Severity = incident.Severity
 		}
-		return
+		if err := updateIncident(ctx, a.db, incident.ID, issue); err != nil {
+			a.logger.Error("incident update failed", "category", category, "error", err)
+		}
 	}
-	if severityRank(active.Severity) > severityRank(worst.Severity) {
-		worst.Severity = active.Severity
-	}
-	_ = updateIncident(ctx, a.db, active.ID, worst)
 }
 
 func severityRank(s Severity) int {
@@ -309,6 +421,14 @@ func profileTransferBytes(profile string) int64 {
 		return 5 * 1024 * 1024
 	}
 	return 256 * 1024
+}
+
+func transferProbeTimeout(bytes int64) time.Duration {
+	duration := time.Duration(float64(bytes*8)/500_000*float64(time.Second)) + 10*time.Second
+	if duration < 30*time.Second {
+		return 30 * time.Second
+	}
+	return duration
 }
 
 func categoryFor(s Sample) string {

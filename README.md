@@ -4,7 +4,7 @@ Dockerized Go service for recording intermittent DNS and internet performance pr
 
 ## Measurements
 
-- Pi-hole and public DNS-over-TCP response time and failures
+- Pi-hole TCP health, Pi-hole UDP diagnostics, and public UDP DNS with truncation-aware TCP fallback
 - Independent TCP internet connectivity
 - HTTP DNS, connect, TLS, time-to-first-byte, total duration, and status
 - Optional bounded transfer-speed test
@@ -37,9 +37,10 @@ For HTTPS behind reverse proxy, set `APP_COOKIE_SECURE=true`. Do not expose plai
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `APP_PASSWORD` | required | UI password |
-| `PIHOLE_DNS_ADDR` | `127.0.0.1:53` | Direct Pi-hole TCP DNS endpoint |
+| `PIHOLE_DNS_ADDR` | `127.0.0.1:53` | Pi-hole UDP endpoint with TCP fallback for truncated replies |
 | `PUBLIC_DNS_ADDR` | `1.1.1.1:53` | Control DNS endpoint |
 | `HTTP_PROBE_URL` | Google 204 endpoint | Small HTTP timing target |
+| `HTTP_DNS_ADDR` | `PIHOLE_DNS_ADDR` | Explicit TCP resolver used by HTTP probes |
 | `HTTP_EXPECTED_STATUS` | `204` | Required probe response; use `0` for any 2xx/3xx |
 | `TRANSFER_PROBE_URL` | Cloudflare speed endpoint | Bounded transfer target |
 | `APP_TIMEZONE` | `Europe/Budapest` | Display timezone |
@@ -59,6 +60,8 @@ Dashboard generates last-day or last-week ZIP reports. Each report contains:
 - `system-info.json`: runtime context
 
 Generated reports run through one background worker and expire after 7 days. Raw measurements retain 30 days; compact 15-minute, hourly, and daily rollups plus incident history remain available. Reports support day, week, month, custom, and all-history ranges. Cleanup runs daily.
+
+Report targets remove URL credentials, query strings, and fragments before persistence. Rollups preserve resolver target plus DNS, connection, TLS, TTFB, and transfer measurements.
 
 ## Development
 

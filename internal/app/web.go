@@ -84,16 +84,22 @@ type loginLimiter struct {
 }
 
 func newLoginLimiter() *loginLimiter { return &loginLimiter{attempts: make(map[string]loginAttempt)} }
-func (l *loginLimiter) key(ip string) string {
+func (l *loginLimiter) makeRoom(ip string) {
 	if _, exists := l.attempts[ip]; exists || len(l.attempts) < 1000 {
-		return ip
+		return
 	}
-	return "__overflow__"
+	var oldestKey string
+	var oldest time.Time
+	for key, attempt := range l.attempts {
+		if oldestKey == "" || attempt.windowStart.Before(oldest) {
+			oldestKey, oldest = key, attempt.windowStart
+		}
+	}
+	delete(l.attempts, oldestKey)
 }
 func (l *loginLimiter) allow(ip string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	ip = l.key(ip)
 	now := time.Now()
 	item := l.attempts[ip]
 	if now.Sub(item.windowStart) > 10*time.Minute {
@@ -105,7 +111,7 @@ func (l *loginLimiter) allow(ip string) bool {
 func (l *loginLimiter) failure(ip string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	ip = l.key(ip)
+	l.makeRoom(ip)
 	now := time.Now()
 	item := l.attempts[ip]
 	if item.windowStart.IsZero() || now.Sub(item.windowStart) > 10*time.Minute {
@@ -118,7 +124,7 @@ func (l *loginLimiter) failure(ip string) {
 	}
 	l.attempts[ip] = item
 }
-func (l *loginLimiter) success(ip string) { l.mu.Lock(); delete(l.attempts, l.key(ip)); l.mu.Unlock() }
+func (l *loginLimiter) success(ip string) { l.mu.Lock(); delete(l.attempts, ip); l.mu.Unlock() }
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err == nil {
@@ -164,6 +170,17 @@ func securityHeaders(next http.Handler) http.Handler {
 func (a *App) health(w http.ResponseWriter, r *http.Request) {
 	if err := a.db.PingContext(r.Context()); err != nil {
 		http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	a.healthMu.RLock()
+	lastPersist, persistErr := a.lastPersist, a.lastPersistErr
+	a.healthMu.RUnlock()
+	if time.Since(a.startedAt) > time.Minute && (lastPersist.IsZero() || time.Since(lastPersist) > time.Minute) {
+		message := "probe scheduler has not persisted a cycle recently"
+		if persistErr != nil {
+			message += ": " + persistErr.Error()
+		}
+		http.Error(w, message, http.StatusServiceUnavailable)
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -269,7 +286,7 @@ func (a *App) dashboardSummary(ctx context.Context) (DashboardSummary, error) {
 	var total, successful int
 	err := a.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(success),0),
 COALESCE(SUM(severity='warning'),0), COALESCE(SUM(severity='error'),0), COALESCE(SUM(severity='critical'),0)
-FROM samples WHERE probe_type='aggregate' AND created_at >= ?`, time.Now().Add(-24*time.Hour).UTC().Format(time.RFC3339Nano)).Scan(&total, &successful, &s.Warnings24, &s.Errors24, &s.Critical24)
+FROM samples WHERE probe_type='aggregate' AND created_at >= ?`, dbTime(time.Now().Add(-24*time.Hour))).Scan(&total, &successful, &s.Warnings24, &s.Errors24, &s.Critical24)
 	if err != nil {
 		return s, err
 	}
@@ -279,7 +296,7 @@ FROM samples WHERE probe_type='aggregate' AND created_at >= ?`, time.Now().Add(-
 	var last string
 	var severity Severity
 	if err := a.db.QueryRowContext(ctx, `SELECT created_at, severity FROM samples WHERE probe_type='aggregate' ORDER BY id DESC LIMIT 1`).Scan(&last, &severity); err == nil {
-		s.LastSampleAt, _ = time.Parse(time.RFC3339Nano, last)
+		s.LastSampleAt, _ = parseDBTime(last)
 		s.Severity, s.Status = severity, "Internet healthy"
 	}
 	s.ActiveIncident, err = activeIncident(ctx, a.db)
