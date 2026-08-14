@@ -325,7 +325,7 @@ func (a *App) incidentsFragment(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	a.render(w, "incidents.html", map[string]any{"Incidents": incidents, "Page": page, "Previous": page > 0, "PreviousPage": max(page-1, 0), "Next": hasMore, "NextPage": page + 1})
+	a.render(w, "incidents.html", map[string]any{"Incidents": incidents, "DisplayPage": page + 1, "Previous": page > 0, "PreviousPage": max(page-1, 0), "Next": hasMore, "NextPage": page + 1})
 }
 
 func (a *App) settingsFragment(w http.ResponseWriter, r *http.Request) {

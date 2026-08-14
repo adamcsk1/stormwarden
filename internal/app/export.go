@@ -201,7 +201,7 @@ func (a *App) writeExport(ctx context.Context, zw *zip.Writer, from, to time.Tim
 		availability = float64(successful) * 100 / float64(total)
 	}
 	summary := fmt.Sprintf("# Stormwarden Diagnostic Report\n\nObservation period: %s to %s\nGenerated: %s\nTraffic profile: %s\n\n## Summary\n\n- Health cycles: %d\n- Availability: %.2f%%\n- Warning cycles: %d\n- Error cycles: %d\n- Critical cycles: %d\n- Incidents: %d\n\n## Interpretation\n\nCompare Pi-hole DNS with public DNS samples to isolate local resolver failures. HTTP records split DNS, TCP connect, TLS, time-to-first-byte, body transfer speed, and total duration. Aggregate records represent household connectivity per probe cycle.\n\n## Privacy\n\nAuthentication secrets, sessions, cookies, headers, and DNS answers are excluded. Configured targets remain because diagnosis requires them.\n", from.In(a.cfg.Timezone).Format(time.RFC3339), to.In(a.cfg.Timezone).Format(time.RFC3339), time.Now().In(a.cfg.Timezone).Format(time.RFC3339), profile, total, availability, warnings, errorCount, criticals, incidentCount)
-	if err := zipText(zw, "README.md", "Upload summary.md and JSONL files to an AI agent. JSONL contains one JSON object per line. Raw data retains 30 days; rollups preserve older trends.\n"); err != nil {
+	if err := zipText(zw, "README.md", "Use summary.md for an overview and the JSONL files for detailed analysis. JSONL contains one JSON object per line. Raw data retains 30 days; rollups preserve older trends.\n"); err != nil {
 		return err
 	}
 	if err := zipText(zw, "summary.md", summary); err != nil {

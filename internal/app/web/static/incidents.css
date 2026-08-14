@@ -1,0 +1,8 @@
+.incident {
+  align-items: flex-start;
+}
+
+.incident > .badge {
+  flex: 0 0 auto;
+  align-self: flex-start;
+}
