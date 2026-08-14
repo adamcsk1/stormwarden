@@ -707,3 +707,88 @@ func TestDNSPathFragmentMarksStaleSamples(t *testing.T) {
 		t.Fatalf("stale state missing: %s", result.Body.String())
 	}
 }
+
+func TestParseAssetTargets(t *testing.T) {
+	targets, err := parseAssetTargets("Video|https://example.test/video.jpg\nNews|https://example.test/news.png;Map|http://example.test/map.webp")
+	if err != nil || len(targets) != 3 || targets[2].Name != "Map" {
+		t.Fatalf("parsed targets = %+v, err = %v", targets, err)
+	}
+	if _, err := parseAssetTargets("File|ftp://example.test/file"); err == nil {
+		t.Fatal("non-HTTP asset URL accepted")
+	}
+	if _, err := parseAssetTargets(strings.Repeat("Image|https://example.test/image.jpg\n", maxAssetTargets+1)); err == nil {
+		t.Fatal("too many asset targets accepted")
+	}
+}
+
+func TestAssetProbeBoundsDownloadAndRecordsSpeed(t *testing.T) {
+	payload := bytes.Repeat([]byte("x"), assetDownloadLimit*2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(payload) }))
+	defer server.Close()
+
+	sample := probeAsset(context.Background(), AssetTarget{Name: "Representative image", URL: server.URL}, "")
+	if !sample.Success || sample.Target != "asset:Representative image|"+server.URL || sample.Bytes != assetDownloadLimit || sample.Mbps <= 0 || sample.DurationMS <= 0 {
+		t.Fatalf("asset result: %+v", sample)
+	}
+}
+
+func TestAssetProbeCyclePersistsConfiguredTarget(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("image")) }))
+	defer server.Close()
+	a := newTestApp(t)
+	configured := "Image|" + server.URL + "/asset.jpg?token=secret"
+	if err := setSetting(context.Background(), a.db, "asset_targets", configured); err != nil {
+		t.Fatal(err)
+	}
+	a.runAssetProbeCycle(context.Background())
+	sample, err := latestSampleByTarget(context.Background(), a.db, "asset:Image|"+server.URL+"/asset.jpg")
+	if err != nil || sample == nil || !sample.Success || strings.Contains(sample.Target, "secret") {
+		t.Fatalf("persisted asset sample = %+v, err = %v", sample, err)
+	}
+}
+
+func TestAssetFragmentShowsPhaseMetrics(t *testing.T) {
+	a := newTestApp(t)
+	if err := setSetting(context.Background(), a.db, "asset_targets", "Video|https://example.test/video.jpg"); err != nil {
+		t.Fatal(err)
+	}
+	if err := insertSample(context.Background(), a.db, Sample{CreatedAt: time.Now(), ProbeType: "asset", Target: "asset:Video|https://example.test/video.jpg", Severity: Info, Success: true, DNSMS: 1, ConnectMS: 2, TLSMS: 3, TTFBMS: 4, DurationMS: 5, Bytes: 1024, Mbps: 6, Message: "healthy"}); err != nil {
+		t.Fatal(err)
+	}
+
+	result := httptest.NewRecorder()
+	a.assetsFragment(result, httptest.NewRequest(http.MethodGet, "/ui/assets", nil))
+	body := result.Body.String()
+	for _, value := range []string{"Video", "DNS", "TCP", "TLS", "TTFB", "Total", "Size", "Speed", "6.0 Mbps"} {
+		if !strings.Contains(body, value) {
+			t.Fatalf("asset fragment missing %q: %s", value, body)
+		}
+	}
+}
+
+func TestSettingsSaveAssetTargets(t *testing.T) {
+	a := newTestApp(t)
+	a.incidentStates["asset_path:Old"] = &incidentState{badCycles: 1}
+	if err := openIncident(context.Background(), a.db, Sample{CreatedAt: time.Now(), ProbeType: "aggregate", Target: "asset_path:Old", Severity: Error, Message: "failed"}); err != nil {
+		t.Fatal(err)
+	}
+	cookie := login(t, a)
+	s, ok := a.sessions.get(cookie.Value)
+	if !ok {
+		t.Fatal("login session missing")
+	}
+	form := url.Values{"profile": {"minimal"}, "asset_targets": {"News|https://example.test/news.jpg"}, "csrf": {s.CSRF}}
+	request := httptest.NewRequest(http.MethodPost, "/ui/settings", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	result := httptest.NewRecorder()
+	a.Handler().ServeHTTP(result, request)
+	configured, err := setting(context.Background(), a.db, "asset_targets")
+	if result.Code != http.StatusOK || err != nil || configured != form.Get("asset_targets") {
+		t.Fatalf("saved asset targets = %q, status = %d, err = %v", configured, result.Code, err)
+	}
+	incidents, err := activeIncidents(context.Background(), a.db)
+	if err != nil || len(incidents) != 0 || a.incidentStates["asset_path:Old"] != nil {
+		t.Fatalf("removed asset incident remains active: incidents=%+v state=%+v err=%v", incidents, a.incidentStates["asset_path:Old"], err)
+	}
+}

@@ -149,6 +149,7 @@ func (a *App) routes() http.Handler {
 	mux.Handle("GET /ui/summary", a.requireAuth(http.HandlerFunc(a.summaryFragment)))
 	mux.Handle("GET /ui/metrics", a.requireAuth(http.HandlerFunc(a.metricsFragment)))
 	mux.Handle("GET /ui/dns-paths", a.requireAuth(http.HandlerFunc(a.dnsPathsFragment)))
+	mux.Handle("GET /ui/assets", a.requireAuth(http.HandlerFunc(a.assetsFragment)))
 	mux.Handle("GET /ui/incidents", a.requireAuth(http.HandlerFunc(a.incidentsFragment)))
 	mux.Handle("GET /ui/settings", a.requireAuth(http.HandlerFunc(a.settingsFragment)))
 	mux.Handle("POST /ui/settings", a.requireAuth(http.HandlerFunc(a.saveSettings)))
@@ -341,6 +342,31 @@ func (a *App) dnsPathsFragment(w http.ResponseWriter, r *http.Request) {
 	a.render(w, "dns-paths.html", map[string]any{"Paths": paths})
 }
 
+type assetPathView struct {
+	Name   string
+	Sample *Sample
+	Stale  bool
+}
+
+func (a *App) assetsFragment(w http.ResponseWriter, r *http.Request) {
+	configured, _ := setting(r.Context(), a.db, "asset_targets")
+	targets, err := parseAssetTargets(configured)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	assets := make([]assetPathView, 0, len(targets))
+	for _, target := range targets {
+		sample, err := latestSampleByTarget(r.Context(), a.db, assetSampleTarget(target))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		assets = append(assets, assetPathView{Name: target.Name, Sample: sample, Stale: sample != nil && time.Since(sample.CreatedAt) > 75*time.Second})
+	}
+	a.render(w, "assets.html", map[string]any{"Assets": assets})
+}
+
 func (a *App) incidentsFragment(w http.ResponseWriter, r *http.Request) {
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	if page < 0 {
@@ -356,11 +382,13 @@ func (a *App) incidentsFragment(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) settingsFragment(w http.ResponseWriter, r *http.Request) {
 	profile, _ := setting(r.Context(), a.db, "profile")
+	assetTargets, _ := setting(r.Context(), a.db, "asset_targets")
 	s := r.Context().Value(sessionContextKey).(session)
-	a.render(w, "settings.html", map[string]any{"Profile": profile, "CSRF": s.CSRF, "Saved": r.URL.Query().Get("saved") != ""})
+	a.render(w, "settings.html", map[string]any{"Profile": profile, "AssetTargets": assetTargets, "CSRF": s.CSRF, "Saved": r.URL.Query().Get("saved") != ""})
 }
 
 func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 32*1024)
 	if err := r.ParseForm(); err != nil || !a.validCSRF(r) {
 		http.Error(w, "invalid request", http.StatusForbidden)
 		return
@@ -370,9 +398,53 @@ func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid profile", http.StatusBadRequest)
 		return
 	}
-	if err := setSetting(r.Context(), a.db, "profile", profile); err != nil {
+	assetTargets := strings.TrimSpace(r.FormValue("asset_targets"))
+	if _, err := parseAssetTargets(assetTargets); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	a.assetMu.Lock()
+	a.incidentMu.Lock()
+	defer a.assetMu.Unlock()
+	defer a.incidentMu.Unlock()
+	incidents, err := activeIncidents(r.Context(), a.db)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	configured, _ := parseAssetTargets(assetTargets)
+	retained := make(map[string]bool, len(configured))
+	for _, target := range configured {
+		retained[assetIncidentCategory(target.Name)] = true
+	}
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+	for key, value := range map[string]string{"profile": profile, "asset_targets": assetTargets} {
+		if _, err := tx.ExecContext(r.Context(), `INSERT INTO settings(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	for _, incident := range incidents {
+		if strings.HasPrefix(incident.Category, "asset_path:") && !retained[incident.Category] {
+			if _, err := tx.ExecContext(r.Context(), `UPDATE incidents SET ended_at=? WHERE id=? AND ended_at IS NULL`, dbTime(time.Now()), incident.ID); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	for category := range a.incidentStates {
+		if strings.HasPrefix(category, "asset_path:") && !retained[category] {
+			delete(a.incidentStates, category)
+		}
 	}
 	r.URL.RawQuery = "saved=1"
 	a.settingsFragment(w, r)
