@@ -2,10 +2,12 @@ package app
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -35,11 +37,69 @@ func probeTCP(ctx context.Context, name, address string) Sample {
 func probeDNS(ctx context.Context, target, address string) Sample {
 	started := time.Now()
 	s := Sample{CreatedAt: started, ProbeType: "dns", Target: target, Severity: Info}
-	conn, err := (&net.Dialer{Timeout: 4 * time.Second}).DialContext(ctx, "tcp", address)
+	idBytes := make([]byte, 2)
+	if _, err := rand.Read(idBytes); err != nil {
+		s.Severity, s.Message = Error, err.Error()
+		return s
+	}
+	id := binary.BigEndian.Uint16(idBytes)
+	query := dnsQuery(id, "example.com")
+	response, err := exchangeDNS(ctx, "udp", address, query)
+	transport := "udp"
+	if err == nil && len(response) >= 4 && response[2]&0x02 != 0 {
+		response, err = exchangeDNS(ctx, "tcp", address, query)
+		transport = "tcp"
+	}
 	if err != nil {
 		s.DurationMS = ms(time.Since(started))
 		s.Severity, s.Message = Error, err.Error()
 		return s
+	}
+	s.DurationMS, s.DNSMS = ms(time.Since(started)), ms(time.Since(started))
+	if err := validateDNSResponse(response, query, id); err != nil {
+		s.Severity, s.Message = Error, err.Error()
+		return s
+	}
+	s.Success = true
+	s.Severity, s.Message = classifyLatency(s.DurationMS, "DNS response")
+	if s.Severity == Info {
+		s.Message = "healthy over " + transport
+	}
+	return s
+}
+
+func probeDNSTCP(ctx context.Context, target, address string) Sample {
+	started := time.Now()
+	s := Sample{CreatedAt: started, ProbeType: "dns", Target: target, Severity: Info}
+	idBytes := make([]byte, 2)
+	if _, err := rand.Read(idBytes); err != nil {
+		s.Severity, s.Message = Error, err.Error()
+		return s
+	}
+	id := binary.BigEndian.Uint16(idBytes)
+	query := dnsQuery(id, "example.com")
+	response, err := exchangeDNS(ctx, "tcp", address, query)
+	s.DurationMS, s.DNSMS = ms(time.Since(started)), ms(time.Since(started))
+	if err != nil {
+		s.Severity, s.Message = Error, err.Error()
+		return s
+	}
+	if err := validateDNSResponse(response, query, id); err != nil {
+		s.Severity, s.Message = Error, err.Error()
+		return s
+	}
+	s.Success = true
+	s.Severity, s.Message = classifyLatency(s.DurationMS, "DNS response")
+	if s.Severity == Info {
+		s.Message = "healthy over tcp"
+	}
+	return s
+}
+
+func exchangeDNS(ctx context.Context, network, address string, query []byte) ([]byte, error) {
+	conn, err := (&net.Dialer{Timeout: 4 * time.Second}).DialContext(ctx, network, address)
+	if err != nil {
+		return nil, err
 	}
 	defer conn.Close()
 	deadline := time.Now().Add(4 * time.Second)
@@ -47,37 +107,83 @@ func probeDNS(ctx context.Context, target, address string) Sample {
 		deadline = contextDeadline
 	}
 	_ = conn.SetDeadline(deadline)
-
-	idBytes := make([]byte, 2)
-	_, _ = rand.Read(idBytes)
-	id := binary.BigEndian.Uint16(idBytes)
-	query := dnsQuery(id, "example.com")
+	if network == "udp" {
+		if _, err := conn.Write(query); err != nil {
+			return nil, err
+		}
+		response := make([]byte, 4096)
+		n, err := conn.Read(response)
+		return response[:n], err
+	}
 	packet := make([]byte, len(query)+2)
 	binary.BigEndian.PutUint16(packet, uint16(len(query)))
 	copy(packet[2:], query)
-	if _, err = conn.Write(packet); err != nil {
-		s.Severity, s.Message = Error, err.Error()
-		return s
+	if _, err := conn.Write(packet); err != nil {
+		return nil, err
 	}
 	reader := bufio.NewReader(conn)
 	lengthBytes := make([]byte, 2)
-	if _, err = io.ReadFull(reader, lengthBytes); err != nil {
-		s.Severity, s.Message = Error, err.Error()
-		return s
+	if _, err := io.ReadFull(reader, lengthBytes); err != nil {
+		return nil, err
 	}
 	response := make([]byte, int(binary.BigEndian.Uint16(lengthBytes)))
-	if _, err = io.ReadFull(reader, response); err != nil {
-		s.Severity, s.Message = Error, err.Error()
-		return s
+	_, err = io.ReadFull(reader, response)
+	return response, err
+}
+
+func validateDNSResponse(response, query []byte, id uint16) error {
+	questionLength := len(query) - 12
+	if len(response) < 12+questionLength {
+		return errors.New("short DNS response")
 	}
-	s.DurationMS, s.DNSMS = ms(time.Since(started)), ms(time.Since(started))
-	if len(response) < 12 || binary.BigEndian.Uint16(response[:2]) != id || response[3]&0x0f != 0 {
-		s.Severity, s.Message = Error, "invalid DNS response"
-		return s
+	if binary.BigEndian.Uint16(response[:2]) != id {
+		return errors.New("DNS response ID mismatch")
 	}
-	s.Success = true
-	s.Severity, s.Message = classifyLatency(s.DurationMS, "DNS response")
-	return s
+	if response[2]&0x80 == 0 || response[2]&0x78 != 0 {
+		return errors.New("invalid DNS response flags")
+	}
+	if response[3]&0x0f != 0 {
+		return fmt.Errorf("DNS response code %d", response[3]&0x0f)
+	}
+	if binary.BigEndian.Uint16(response[4:6]) != 1 || binary.BigEndian.Uint16(response[6:8]) == 0 {
+		return errors.New("DNS response has no answer")
+	}
+	if !bytes.Equal(response[12:12+questionLength], query[12:]) {
+		return errors.New("DNS response question mismatch")
+	}
+	if !validDNSAnswer(response, 12+questionLength) {
+		return errors.New("malformed DNS answer")
+	}
+	return nil
+}
+
+func validDNSAnswer(response []byte, offset int) bool {
+	if offset >= len(response) {
+		return false
+	}
+	if response[offset]&0xc0 == 0xc0 {
+		offset += 2
+	} else {
+		for {
+			if offset >= len(response) {
+				return false
+			}
+			length := int(response[offset])
+			offset++
+			if length == 0 {
+				break
+			}
+			if length > 63 || offset+length > len(response) {
+				return false
+			}
+			offset += length
+		}
+	}
+	if offset+10 > len(response) {
+		return false
+	}
+	rdLength := int(binary.BigEndian.Uint16(response[offset+8 : offset+10]))
+	return offset+10+rdLength <= len(response)
 }
 
 func dnsQuery(id uint16, domain string) []byte {
@@ -98,8 +204,12 @@ func probeHTTP(ctx context.Context, probeType, url string, limit int64) Sample {
 }
 
 func probeHTTPStatus(ctx context.Context, probeType, url string, limit int64, expectedStatus int) Sample {
+	return probeHTTPStatusResolver(ctx, probeType, url, limit, expectedStatus, "")
+}
+
+func probeHTTPStatusResolver(ctx context.Context, probeType, url string, limit int64, expectedStatus int, dnsAddress string) Sample {
 	started := time.Now()
-	s := Sample{CreatedAt: started, ProbeType: probeType, Target: url, Severity: Info}
+	s := Sample{CreatedAt: started, ProbeType: probeType, Target: redactURL(url), Severity: Info}
 	var dnsStart, connectStart, tlsStart, wroteRequest time.Time
 	trace := &httptrace.ClientTrace{
 		DNSStart: func(httptrace.DNSStartInfo) { dnsStart = time.Now() },
@@ -131,33 +241,39 @@ func probeHTTPStatus(ctx context.Context, probeType, url string, limit int64, ex
 	}
 	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), http.MethodGet, url, nil)
 	if err != nil {
-		s.Severity, s.Message = Error, err.Error()
+		s.Severity, s.Message = Error, redactHTTPError(err, url)
 		return s
 	}
 	req.Header.Set("User-Agent", "stormwarden/1.0")
-	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true, TLSHandshakeTimeout: 4 * time.Second}}
+	dialer := &net.Dialer{}
+	if dnsAddress != "" {
+		dialer.Resolver = &net.Resolver{PreferGo: true, Dial: func(resolveCtx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(resolveCtx, "tcp", dnsAddress)
+		}}
+	}
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true, TLSHandshakeTimeout: 4 * time.Second, DialContext: dialer.DialContext}}
 	resp, err := client.Do(req)
 	if err != nil {
 		s.DurationMS = ms(time.Since(started))
-		s.Severity, s.Message = Error, err.Error()
+		s.Severity, s.Message = Error, redactHTTPError(err, url)
 		return s
 	}
 	defer resp.Body.Close()
 	s.StatusCode = resp.StatusCode
-	bodyReadStarted := time.Now()
-	s.Bytes, err = io.Copy(io.Discard, io.LimitReader(resp.Body, limit))
-	s.DurationMS = ms(time.Since(started))
-	bodyDuration := time.Since(bodyReadStarted)
-	if err != nil {
-		s.Severity, s.Message = Error, err.Error()
-		return s
-	}
 	statusInvalid := expectedStatus > 0 && resp.StatusCode != expectedStatus
 	if expectedStatus == 0 {
 		statusInvalid = resp.StatusCode < 200 || resp.StatusCode >= 400
 	}
 	if statusInvalid {
 		s.Severity, s.Message = Error, fmt.Sprintf("unexpected HTTP status %d", resp.StatusCode)
+		return s
+	}
+	bodyReadStarted := time.Now()
+	s.Bytes, err = io.Copy(io.Discard, io.LimitReader(resp.Body, limit))
+	s.DurationMS = ms(time.Since(started))
+	bodyDuration := time.Since(bodyReadStarted)
+	if err != nil {
+		s.Severity, s.Message = Error, err.Error()
 		return s
 	}
 	s.Success = true
@@ -212,4 +328,23 @@ func transferURL(configured string, bytes int64) string {
 	query.Set("bytes", fmt.Sprintf("%d", bytes))
 	parsed.RawQuery = query.Encode()
 	return parsed.String()
+}
+
+func redactURL(value string) string {
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return "invalid-url"
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+func redactHTTPError(err error, rawURL string) string {
+	var urlError *url.Error
+	if errors.As(err, &urlError) {
+		return urlError.Op + ": " + urlError.Err.Error()
+	}
+	return strings.ReplaceAll(err.Error(), rawURL, redactURL(rawURL))
 }

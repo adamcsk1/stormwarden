@@ -7,20 +7,33 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
+const dbTimeLayout = "2006-01-02T15:04:05.000000000Z"
+
+func dbTime(value time.Time) string { return value.UTC().Format(dbTimeLayout) }
+
+func parseDBTime(value string) (time.Time, error) {
+	if parsed, err := time.Parse(dbTimeLayout, value); err == nil {
+		return parsed, nil
+	}
+	return time.Parse(time.RFC3339Nano, value)
+}
+
 func openDB(path string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", path)
+	dsn := "file:" + filepath.ToSlash(path) + "?_pragma=busy_timeout%3d5000&_pragma=foreign_keys%3don&_pragma=journal_mode%3dWAL"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
+	db.SetMaxOpenConns(2)
 	if _, err = db.Exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;`); err != nil {
 		db.Close()
 		return nil, err
@@ -63,6 +76,7 @@ CREATE TABLE IF NOT EXISTS incidents (
   evidence TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_incidents_started ON incidents(started_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_incidents_active_category ON incidents(category) WHERE ended_at IS NULL;
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 INSERT OR IGNORE INTO settings(key, value) VALUES ('profile', 'low');
 CREATE TABLE IF NOT EXISTS exports (
@@ -91,6 +105,24 @@ CREATE TABLE IF NOT EXISTS daily_rollups (
   warnings INTEGER NOT NULL, errors INTEGER NOT NULL, criticals INTEGER NOT NULL,
   avg_duration_ms REAL NOT NULL, avg_ttfb_ms REAL NOT NULL, avg_mbps REAL NOT NULL,
   PRIMARY KEY(bucket, probe_type)
+);
+CREATE TABLE IF NOT EXISTS quarter_hour_rollups_v2 (
+  bucket TEXT NOT NULL, probe_type TEXT NOT NULL, target TEXT NOT NULL, samples INTEGER NOT NULL, successes INTEGER NOT NULL,
+  warnings INTEGER NOT NULL, errors INTEGER NOT NULL, criticals INTEGER NOT NULL,
+  avg_duration_ms REAL NOT NULL, avg_dns_ms REAL NOT NULL, avg_connect_ms REAL NOT NULL, avg_tls_ms REAL NOT NULL,
+  avg_ttfb_ms REAL NOT NULL, avg_mbps REAL NOT NULL, PRIMARY KEY(bucket, probe_type, target)
+);
+CREATE TABLE IF NOT EXISTS hourly_rollups_v2 (
+  bucket TEXT NOT NULL, probe_type TEXT NOT NULL, target TEXT NOT NULL, samples INTEGER NOT NULL, successes INTEGER NOT NULL,
+  warnings INTEGER NOT NULL, errors INTEGER NOT NULL, criticals INTEGER NOT NULL,
+  avg_duration_ms REAL NOT NULL, avg_dns_ms REAL NOT NULL, avg_connect_ms REAL NOT NULL, avg_tls_ms REAL NOT NULL,
+  avg_ttfb_ms REAL NOT NULL, avg_mbps REAL NOT NULL, PRIMARY KEY(bucket, probe_type, target)
+);
+CREATE TABLE IF NOT EXISTS daily_rollups_v2 (
+  bucket TEXT NOT NULL, probe_type TEXT NOT NULL, target TEXT NOT NULL, samples INTEGER NOT NULL, successes INTEGER NOT NULL,
+  warnings INTEGER NOT NULL, errors INTEGER NOT NULL, criticals INTEGER NOT NULL,
+  avg_duration_ms REAL NOT NULL, avg_dns_ms REAL NOT NULL, avg_connect_ms REAL NOT NULL, avg_tls_ms REAL NOT NULL,
+  avg_ttfb_ms REAL NOT NULL, avg_mbps REAL NOT NULL, PRIMARY KEY(bucket, probe_type, target)
 );`)
 	if err != nil {
 		return err
@@ -100,6 +132,27 @@ CREATE TABLE IF NOT EXISTS daily_rollups (
 	}
 	if err := ensureColumn(db, "exports", "error", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
+	}
+	if value, _ := setting(context.Background(), db, "fixed_timestamps_v1"); value != "done" {
+		tx, err := db.Begin()
+		if err != nil {
+			return err
+		}
+		for _, statement := range []string{
+			`UPDATE samples SET created_at=strftime('%Y-%m-%dT%H:%M:%f',created_at)||'000000Z' WHERE length(created_at)<>30`,
+			`UPDATE incidents SET started_at=strftime('%Y-%m-%dT%H:%M:%f',started_at)||'000000Z' WHERE length(started_at)<>30`,
+			`UPDATE incidents SET ended_at=strftime('%Y-%m-%dT%H:%M:%f',ended_at)||'000000Z' WHERE ended_at IS NOT NULL AND length(ended_at)<>30`,
+			`UPDATE exports SET created_at=strftime('%Y-%m-%dT%H:%M:%f',created_at)||'000000Z' WHERE length(created_at)<>30`,
+			`INSERT INTO settings(key,value) VALUES ('fixed_timestamps_v1','done') ON CONFLICT(key) DO UPDATE SET value='done'`,
+		} {
+			if _, err := tx.Exec(statement); err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
 	}
 	_, err = db.Exec(`INSERT OR IGNORE INTO quarter_hour_rollups(bucket, probe_type, samples, successes, warnings, errors, criticals, avg_duration_ms, avg_ttfb_ms, avg_mbps)
 SELECT bucket, probe_type, samples, successes, warnings, errors, criticals, avg_duration_ms, avg_ttfb_ms, avg_mbps FROM hourly_rollups`)
@@ -111,7 +164,17 @@ SELECT d.bucket, d.probe_type, d.samples, d.successes, d.warnings, d.errors, d.c
 FROM daily_rollups d WHERE NOT EXISTS (
   SELECT 1 FROM quarter_hour_rollups q WHERE q.probe_type=d.probe_type AND substr(q.bucket,1,10)=substr(d.bucket,1,10)
 )`)
-	return err
+	if err != nil {
+		return err
+	}
+	for oldTable, newTable := range map[string]string{"quarter_hour_rollups": "quarter_hour_rollups_v2", "hourly_rollups": "hourly_rollups_v2", "daily_rollups": "daily_rollups_v2"} {
+		query := fmt.Sprintf(`INSERT OR IGNORE INTO %s(bucket, probe_type, target, samples, successes, warnings, errors, criticals, avg_duration_ms, avg_dns_ms, avg_connect_ms, avg_tls_ms, avg_ttfb_ms, avg_mbps)
+SELECT CASE WHEN instr(bucket,'.')=0 THEN replace(bucket,'Z','.000000000Z') ELSE bucket END, probe_type, 'unknown', samples, successes, warnings, errors, criticals, avg_duration_ms, 0, 0, 0, avg_ttfb_ms, avg_mbps FROM %s`, newTable, oldTable)
+		if _, err := db.Exec(query); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func ensureColumn(db *sql.DB, table, column, definition string) error {
@@ -143,10 +206,82 @@ func ensureColumn(db *sql.DB, table, column, definition string) error {
 	return err
 }
 
+func applyPrivacyMigration(db *sql.DB, exportDir string) error {
+	if value, err := setting(context.Background(), db, "privacy_scrub_v2"); err == nil && value == "done" {
+		return nil
+	}
+	rows, err := db.Query(`SELECT id, target FROM samples WHERE probe_type IN ('http','transfer')`)
+	if err != nil {
+		return err
+	}
+	type targetRow struct {
+		id     int64
+		target string
+	}
+	var targets []targetRow
+	for rows.Next() {
+		var row targetRow
+		if err := rows.Scan(&row.id, &row.target); err != nil {
+			rows.Close()
+			return err
+		}
+		targets = append(targets, row)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, row := range targets {
+		redactedTarget := redactURL(row.target)
+		redactedMessage := "Historical HTTP probe result (details redacted)"
+		if _, err := db.Exec(`UPDATE samples SET target=?, message=? WHERE id=?`, redactedTarget, redactedMessage, row.id); err != nil {
+			return err
+		}
+	}
+	if _, err := db.Exec(`UPDATE incidents SET summary='Historical HTTP incident (details redacted)', evidence='' WHERE category IN ('slow_ttfb','tls_handshake','internet_connectivity','slow_transfer')`); err != nil {
+		return err
+	}
+	exportRows, err := db.Query(`SELECT path FROM exports`)
+	if err != nil {
+		return err
+	}
+	var paths []string
+	for exportRows.Next() {
+		var path string
+		if err := exportRows.Scan(&path); err != nil {
+			exportRows.Close()
+			return err
+		}
+		paths = append(paths, path)
+	}
+	if err := exportRows.Close(); err != nil {
+		return err
+	}
+	cleanDir, err := filepath.Abs(exportDir)
+	if err != nil {
+		return err
+	}
+	for _, path := range paths {
+		cleanPath, pathErr := filepath.Abs(path)
+		if pathErr != nil || !strings.HasPrefix(cleanPath, cleanDir+string(os.PathSeparator)) {
+			continue
+		}
+		if err := os.Remove(cleanPath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	if _, err := db.Exec(`DELETE FROM exports`); err != nil {
+		return err
+	}
+	if err := setSetting(context.Background(), db, "privacy_scrub_v1", "done"); err != nil {
+		return err
+	}
+	return setSetting(context.Background(), db, "privacy_scrub_v2", "done")
+}
+
 func insertSample(ctx context.Context, db *sql.DB, s Sample) error {
 	_, err := db.ExecContext(ctx, `INSERT INTO samples
 (created_at, probe_type, target, severity, success, duration_ms, dns_ms, connect_ms, tls_ms, ttfb_ms, bytes, mbps, status_code, message)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, s.CreatedAt.UTC().Format(time.RFC3339Nano), s.ProbeType,
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, dbTime(s.CreatedAt), s.ProbeType,
 		s.Target, s.Severity, s.Success, s.DurationMS, s.DNSMS, s.ConnectMS, s.TLSMS, s.TTFBMS, s.Bytes, s.Mbps, s.StatusCode, s.Message)
 	return err
 }
@@ -159,14 +294,14 @@ func scanSample(rows interface{ Scan(...any) error }) (Sample, error) {
 	if err != nil {
 		return s, err
 	}
-	s.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
+	s.CreatedAt, err = parseDBTime(created)
 	return s, err
 }
 
 const sampleColumns = `id, created_at, probe_type, target, severity, success, duration_ms, dns_ms, connect_ms, tls_ms, ttfb_ms, bytes, mbps, status_code, message`
 
 func recentSamples(ctx context.Context, db *sql.DB, since time.Time, limit int) ([]Sample, error) {
-	rows, err := db.QueryContext(ctx, `SELECT `+sampleColumns+` FROM samples WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?`, since.UTC().Format(time.RFC3339Nano), limit)
+	rows, err := db.QueryContext(ctx, `SELECT `+sampleColumns+` FROM samples WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?`, dbTime(since), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -182,6 +317,18 @@ func recentSamples(ctx context.Context, db *sql.DB, since time.Time, limit int) 
 	return result, rows.Err()
 }
 
+func latestSampleTime(ctx context.Context, db *sql.DB, probeType string) (time.Time, error) {
+	var value string
+	err := db.QueryRowContext(ctx, `SELECT created_at FROM samples WHERE probe_type=? ORDER BY created_at DESC LIMIT 1`, probeType).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	return parseDBTime(value)
+}
+
 func setting(ctx context.Context, db *sql.DB, key string) (string, error) {
 	var value string
 	err := db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
@@ -194,12 +341,29 @@ func setSetting(ctx context.Context, db *sql.DB, key, value string) error {
 }
 
 func activeIncident(ctx context.Context, db *sql.DB) (*Incident, error) {
-	row := db.QueryRowContext(ctx, `SELECT id, started_at, ended_at, severity, category, summary, evidence FROM incidents WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1`)
+	row := db.QueryRowContext(ctx, `SELECT id, started_at, ended_at, severity, category, summary, evidence FROM incidents WHERE ended_at IS NULL ORDER BY CASE severity WHEN 'critical' THEN 3 WHEN 'error' THEN 2 WHEN 'warning' THEN 1 ELSE 0 END DESC, id DESC LIMIT 1`)
 	incident, err := scanIncident(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	return &incident, err
+}
+
+func activeIncidents(ctx context.Context, db *sql.DB) ([]Incident, error) {
+	rows, err := db.QueryContext(ctx, `SELECT id, started_at, ended_at, severity, category, summary, evidence FROM incidents WHERE ended_at IS NULL ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []Incident
+	for rows.Next() {
+		incident, err := scanIncident(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, incident)
+	}
+	return result, rows.Err()
 }
 
 func scanIncident(row interface{ Scan(...any) error }) (Incident, error) {
@@ -210,9 +374,9 @@ func scanIncident(row interface{ Scan(...any) error }) (Incident, error) {
 	if err != nil {
 		return i, err
 	}
-	i.StartedAt, err = time.Parse(time.RFC3339Nano, started)
+	i.StartedAt, err = parseDBTime(started)
 	if err == nil && ended.Valid {
-		t, parseErr := time.Parse(time.RFC3339Nano, ended.String)
+		t, parseErr := parseDBTime(ended.String)
 		if parseErr != nil {
 			return i, parseErr
 		}
@@ -222,7 +386,7 @@ func scanIncident(row interface{ Scan(...any) error }) (Incident, error) {
 }
 
 func recentIncidents(ctx context.Context, db *sql.DB, since time.Time, limit int) ([]Incident, error) {
-	rows, err := db.QueryContext(ctx, `SELECT id, started_at, ended_at, severity, category, summary, evidence FROM incidents WHERE started_at >= ? ORDER BY started_at DESC LIMIT ?`, since.UTC().Format(time.RFC3339Nano), limit)
+	rows, err := db.QueryContext(ctx, `SELECT id, started_at, ended_at, severity, category, summary, evidence FROM incidents WHERE started_at >= ? ORDER BY started_at DESC LIMIT ?`, dbTime(since), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -262,41 +426,44 @@ func incidentPage(ctx context.Context, db *sql.DB, limit, offset int) ([]Inciden
 func openIncident(ctx context.Context, db *sql.DB, s Sample) error {
 	category := categoryFor(s)
 	summary := fmt.Sprintf("%s probe degraded: %s", s.ProbeType, s.Message)
-	evidence := fmt.Sprintf("target=%s duration=%.0fms ttfb=%.0fms throughput=%.2fMbps", s.Target, s.DurationMS, s.TTFBMS, s.Mbps)
-	_, err := db.ExecContext(ctx, `INSERT INTO incidents(started_at, severity, category, summary, evidence) VALUES (?, ?, ?, ?, ?)`, time.Now().UTC().Format(time.RFC3339Nano), s.Severity, category, summary, evidence)
+	evidence := fmt.Sprintf("target=%s duration=%.0fms dns=%.0fms connect=%.0fms tls=%.0fms ttfb=%.0fms throughput=%.2fMbps", s.Target, s.DurationMS, s.DNSMS, s.ConnectMS, s.TLSMS, s.TTFBMS, s.Mbps)
+	_, err := db.ExecContext(ctx, `INSERT INTO incidents(started_at, severity, category, summary, evidence) VALUES (?, ?, ?, ?, ?)`, dbTime(time.Now()), s.Severity, category, summary, evidence)
 	return err
 }
 
 func closeIncident(ctx context.Context, db *sql.DB, id int64) error {
-	_, err := db.ExecContext(ctx, `UPDATE incidents SET ended_at=? WHERE id=? AND ended_at IS NULL`, time.Now().UTC().Format(time.RFC3339Nano), id)
+	_, err := db.ExecContext(ctx, `UPDATE incidents SET ended_at=? WHERE id=? AND ended_at IS NULL`, dbTime(time.Now()), id)
 	return err
 }
 
 func updateIncident(ctx context.Context, db *sql.DB, id int64, s Sample) error {
-	evidence := fmt.Sprintf("\n%s target=%s severity=%s message=%s", time.Now().UTC().Format(time.RFC3339), s.Target, s.Severity, s.Message)
+	evidence := fmt.Sprintf("\n%s target=%s severity=%s duration=%.0fms dns=%.0fms connect=%.0fms tls=%.0fms ttfb=%.0fms throughput=%.2fMbps message=%s", time.Now().UTC().Format(time.RFC3339), s.Target, s.Severity, s.DurationMS, s.DNSMS, s.ConnectMS, s.TLSMS, s.TTFBMS, s.Mbps, s.Message)
 	_, err := db.ExecContext(ctx, `UPDATE incidents SET severity=?, category=?, summary=?, evidence=substr(evidence || ?, -12000) WHERE id=? AND ended_at IS NULL`, s.Severity, s.Target, s.Message, evidence, id)
 	return err
 }
 
 func cleanup(ctx context.Context, db *sql.DB, rawRetention time.Duration) error {
-	cutoff := time.Now().UTC().Truncate(15 * time.Minute).Add(-rawRetention).Format(time.RFC3339Nano)
+	cutoff := dbTime(time.Now().UTC().Truncate(15 * time.Minute).Add(-rawRetention))
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	for table, bucket := range map[string]string{
-		"quarter_hour_rollups": "substr(created_at,1,14) || printf('%02d', (CAST(substr(created_at,15,2) AS INTEGER)/15)*15) || ':00Z'",
-		"hourly_rollups":       "substr(created_at,1,13) || ':00:00Z'",
-		"daily_rollups":        "substr(created_at,1,10) || 'T00:00:00Z'",
+		"quarter_hour_rollups_v2": "substr(created_at,1,14) || printf('%02d', (CAST(substr(created_at,15,2) AS INTEGER)/15)*15) || ':00.000000000Z'",
+		"hourly_rollups_v2":       "substr(created_at,1,13) || ':00:00.000000000Z'",
+		"daily_rollups_v2":        "substr(created_at,1,10) || 'T00:00:00.000000000Z'",
 	} {
-		query := fmt.Sprintf(`INSERT INTO %s(bucket, probe_type, samples, successes, warnings, errors, criticals, avg_duration_ms, avg_ttfb_ms, avg_mbps)
-SELECT %s, probe_type, COUNT(*), SUM(success), SUM(severity='warning'), SUM(severity='error'), SUM(severity='critical'), AVG(duration_ms), AVG(ttfb_ms), AVG(mbps)
-FROM samples WHERE created_at < ? GROUP BY 1, 2
-ON CONFLICT(bucket, probe_type) DO UPDATE SET
+		query := fmt.Sprintf(`INSERT INTO %s(bucket, probe_type, target, samples, successes, warnings, errors, criticals, avg_duration_ms, avg_dns_ms, avg_connect_ms, avg_tls_ms, avg_ttfb_ms, avg_mbps)
+SELECT %s, probe_type, target, COUNT(*), SUM(success), SUM(severity='warning'), SUM(severity='error'), SUM(severity='critical'), AVG(duration_ms), AVG(dns_ms), AVG(connect_ms), AVG(tls_ms), AVG(ttfb_ms), AVG(mbps)
+FROM samples WHERE created_at < ? GROUP BY 1, 2, 3
+ON CONFLICT(bucket, probe_type, target) DO UPDATE SET
 samples=samples+excluded.samples, successes=successes+excluded.successes, warnings=warnings+excluded.warnings,
 errors=errors+excluded.errors, criticals=criticals+excluded.criticals,
 avg_duration_ms=((avg_duration_ms*samples)+(excluded.avg_duration_ms*excluded.samples))/(samples+excluded.samples),
+avg_dns_ms=((avg_dns_ms*samples)+(excluded.avg_dns_ms*excluded.samples))/(samples+excluded.samples),
+avg_connect_ms=((avg_connect_ms*samples)+(excluded.avg_connect_ms*excluded.samples))/(samples+excluded.samples),
+avg_tls_ms=((avg_tls_ms*samples)+(excluded.avg_tls_ms*excluded.samples))/(samples+excluded.samples),
 avg_ttfb_ms=((avg_ttfb_ms*samples)+(excluded.avg_ttfb_ms*excluded.samples))/(samples+excluded.samples),
 avg_mbps=((avg_mbps*samples)+(excluded.avg_mbps*excluded.samples))/(samples+excluded.samples)`, table, bucket)
 		if _, err := tx.ExecContext(ctx, query, cutoff); err != nil {

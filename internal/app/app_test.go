@@ -4,6 +4,8 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -51,6 +53,39 @@ func TestTrafficProfiles(t *testing.T) {
 	}
 	if got := transferURL("https://example.test/file?bytes=1", 99); got != "https://example.test/file?bytes=99" {
 		t.Fatalf("transfer URL = %q", got)
+	}
+}
+
+func TestDNSResponseValidation(t *testing.T) {
+	query := dnsQuery(42, "example.com")
+	if err := validateDNSResponse(query, query, 42); err == nil {
+		t.Fatal("query echo accepted as response")
+	}
+	empty := append([]byte(nil), query...)
+	empty[2], empty[3] = 0x81, 0x80
+	if err := validateDNSResponse(empty, query, 42); err == nil {
+		t.Fatal("zero-answer response accepted")
+	}
+	valid := append(empty, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4)
+	binary.BigEndian.PutUint16(valid[6:8], 1)
+	if err := validateDNSResponse(valid, query, 42); err != nil {
+		t.Fatalf("valid response rejected: %v", err)
+	}
+}
+
+func TestURLRedaction(t *testing.T) {
+	got := redactURL("https://user:password@example.test/path?token=secret#fragment")
+	if got != "https://example.test/path" {
+		t.Fatalf("redacted URL = %q", got)
+	}
+}
+
+func TestHTTPErrorRedaction(t *testing.T) {
+	raw := "https://user:password@example.test/path?token=secret"
+	err := &url.Error{Op: "Get", URL: raw, Err: errors.New("dial failed")}
+	message := redactHTTPError(err, raw)
+	if strings.Contains(message, "secret") || strings.Contains(message, "password") {
+		t.Fatalf("HTTP error leaked URL: %s", message)
 	}
 }
 
@@ -132,7 +167,7 @@ func TestAggregateCriticalAfterConsecutiveFailures(t *testing.T) {
 	failure := func(target string) Sample {
 		return Sample{ProbeType: "tcp", Target: target, Severity: Error, Message: "failed"}
 	}
-	samples := []Sample{failure("pihole"), failure("internet-tcp"), failure("http")}
+	samples := []Sample{failure("pihole"), failure("public-dns"), failure("internet-tcp")}
 	if got := a.aggregateSample(samples); got.Severity != Error {
 		t.Fatalf("first cycle = %s", got.Severity)
 	}
@@ -155,9 +190,19 @@ func TestIncidentHysteresisAndCauseUpdate(t *testing.T) {
 	}
 	changed := Sample{ProbeType: "aggregate", Target: "slow_ttfb", Severity: Warning, Message: "slow response"}
 	a.updateIncident(context.Background(), changed)
-	active, _ = activeIncident(context.Background(), a.db)
-	if active.Category != "slow_ttfb" || active.Severity != Error || !strings.Contains(active.Evidence, "slow response") {
-		t.Fatalf("cause/evidence not updated: %+v", active)
+	a.updateIncident(context.Background(), changed)
+	activeList, _ := activeIncidents(context.Background(), a.db)
+	if len(activeList) != 2 {
+		t.Fatalf("concurrent incidents = %d", len(activeList))
+	}
+	foundSlow := false
+	for _, incident := range activeList {
+		if incident.Category == "slow_ttfb" && strings.Contains(incident.Summary, "slow response") {
+			foundSlow = true
+		}
+	}
+	if !foundSlow {
+		t.Fatalf("slow incident missing: %+v", activeList)
 	}
 	healthy := Sample{ProbeType: "aggregate", Severity: Info}
 	a.updateIncident(context.Background(), healthy)
@@ -168,6 +213,36 @@ func TestIncidentHysteresisAndCauseUpdate(t *testing.T) {
 	a.updateIncident(context.Background(), healthy)
 	if active, _ = activeIncident(context.Background(), a.db); active != nil {
 		t.Fatal("incident did not recover after three cycles")
+	}
+}
+
+func TestTransferIncidentOnlyRecoversWhenObserved(t *testing.T) {
+	a := newTestApp(t)
+	slow := Sample{ProbeType: "aggregate", Target: "slow_transfer", Severity: Warning, Message: "slow"}
+	a.updateIncident(context.Background(), slow)
+	a.updateIncident(context.Background(), slow)
+	for range 3 {
+		a.updateIncidents(context.Background(), nil, map[string]bool{"local_dns": true})
+	}
+	active, _ := activeIncidents(context.Background(), a.db)
+	if len(active) != 1 {
+		t.Fatalf("unobserved transfer incident closed: %d", len(active))
+	}
+	for range 3 {
+		a.updateIncidents(context.Background(), nil, map[string]bool{"slow_transfer": true})
+	}
+	active, _ = activeIncidents(context.Background(), a.db)
+	if len(active) != 0 {
+		t.Fatalf("observed healthy transfer did not close incident: %d", len(active))
+	}
+}
+
+func TestTransferTimeoutMeasuresBelowOneMbps(t *testing.T) {
+	if timeout := transferProbeTimeout(5 * 1024 * 1024); timeout < 80*time.Second {
+		t.Fatalf("detailed timeout too short: %v", timeout)
+	}
+	if timeout := transferProbeTimeout(256 * 1024); timeout != 30*time.Second {
+		t.Fatalf("low timeout = %v", timeout)
 	}
 }
 
@@ -197,8 +272,8 @@ func TestCleanupRollsUpRawData(t *testing.T) {
 	}
 	var raw, quarter, daily int
 	_ = a.db.QueryRow(`SELECT COUNT(*) FROM samples`).Scan(&raw)
-	_ = a.db.QueryRow(`SELECT COUNT(*) FROM quarter_hour_rollups WHERE probe_type='aggregate'`).Scan(&quarter)
-	_ = a.db.QueryRow(`SELECT COUNT(*) FROM daily_rollups WHERE probe_type='aggregate'`).Scan(&daily)
+	_ = a.db.QueryRow(`SELECT COUNT(*) FROM quarter_hour_rollups_v2 WHERE probe_type='aggregate' AND target='internet'`).Scan(&quarter)
+	_ = a.db.QueryRow(`SELECT COUNT(*) FROM daily_rollups_v2 WHERE probe_type='aggregate' AND target='internet'`).Scan(&daily)
 	if raw != 0 || quarter != 1 || daily != 1 {
 		t.Fatalf("raw=%d quarter=%d daily=%d", raw, quarter, daily)
 	}
@@ -212,7 +287,7 @@ func TestPendingExportMarkedFailedAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = a.db.Exec(`INSERT INTO exports(id, created_at, range_name, path, size, status) VALUES ('pending', ?, 'day', '', 0, 'pending')`, time.Now().UTC().Format(time.RFC3339Nano))
+	_, _ = a.db.Exec(`INSERT INTO exports(id, created_at, range_name, path, size, status) VALUES ('pending', ?, 'day', '', 0, 'pending')`, dbTime(time.Now()))
 	_ = a.Close()
 	a, err = New(cfg, logger)
 	if err != nil {
@@ -223,6 +298,31 @@ func TestPendingExportMarkedFailedAfterRestart(t *testing.T) {
 	_ = a.db.QueryRow(`SELECT status FROM exports WHERE id='pending'`).Scan(&status)
 	if status != "failed" {
 		t.Fatalf("pending export status = %s", status)
+	}
+}
+
+func TestPrivacyV2ScrubsExistingIncidents(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{Password: "test", DataPath: filepath.Join(dir, "test.db"), ExportDir: filepath.Join(dir, "exports"), Timezone: time.UTC}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	a, err := New(cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = a.db.Exec(`DELETE FROM settings WHERE key='privacy_scrub_v2'`)
+	_, _ = a.db.Exec(`INSERT INTO incidents(started_at, severity, category, summary, evidence) VALUES (?, 'error', 'slow_ttfb', 'token=secret', 'url?token=secret')`, dbTime(time.Now()))
+	_ = a.Close()
+	a, err = New(cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	var summary, evidence string
+	if err := a.db.QueryRow(`SELECT summary, evidence FROM incidents LIMIT 1`).Scan(&summary, &evidence); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(summary+evidence, "secret") {
+		t.Fatalf("incident was not scrubbed: %s %s", summary, evidence)
 	}
 }
 
@@ -265,7 +365,7 @@ func TestExpiredExportCleanupDoesNotDeadlock(t *testing.T) {
 	if err := os.WriteFile(path, []byte("test"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, _ = a.db.Exec(`INSERT INTO exports(id, created_at, range_name, path, size, status) VALUES ('old', ?, 'day', ?, 4, 'complete')`, time.Now().Add(-8*24*time.Hour).UTC().Format(time.RFC3339Nano), path)
+	_, _ = a.db.Exec(`INSERT INTO exports(id, created_at, range_name, path, size, status) VALUES ('old', ?, 'day', ?, 4, 'complete')`, dbTime(time.Now().Add(-8*24*time.Hour)), path)
 	done := make(chan struct{})
 	go func() { a.cleanupExports(); close(done) }()
 	select {
@@ -286,9 +386,9 @@ func TestExportContainsBoundedAIData(t *testing.T) {
 	outside.Message = "outside"
 	_ = insertSample(context.Background(), a.db, inside)
 	_ = insertSample(context.Background(), a.db, outside)
-	_, _ = a.db.Exec(`INSERT INTO incidents(started_at, severity, category, summary, evidence) VALUES (?, 'error', 'outage', 'overlapping', '')`, time.Now().Add(-48*time.Hour).UTC().Format(time.RFC3339Nano))
+	_, _ = a.db.Exec(`INSERT INTO incidents(started_at, severity, category, summary, evidence) VALUES (?, 'error', 'outage', 'overlapping', '')`, dbTime(time.Now().Add(-48*time.Hour)))
 	job := exportJob{ID: "test-export", RangeName: "day", From: time.Now().Add(-24 * time.Hour), To: time.Now().Add(time.Minute)}
-	_, _ = a.db.Exec(`INSERT INTO exports(id, created_at, range_name, path, size, status) VALUES (?, ?, 'day', '', 0, 'pending')`, job.ID, time.Now().UTC().Format(time.RFC3339Nano))
+	_, _ = a.db.Exec(`INSERT INTO exports(id, created_at, range_name, path, size, status) VALUES (?, ?, 'day', '', 0, 'pending')`, job.ID, dbTime(time.Now()))
 	if err := a.processExport(context.Background(), job); err != nil {
 		t.Fatal(err)
 	}
@@ -363,6 +463,23 @@ func TestLoginDashboardAndCSRF(t *testing.T) {
 	}
 }
 
+func TestHealthDetectsStalePersistence(t *testing.T) {
+	a := newTestApp(t)
+	a.startedAt, a.lastPersist = time.Now().Add(-2*time.Minute), time.Now().Add(-2*time.Minute)
+	request := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	result := httptest.NewRecorder()
+	a.health(result, request)
+	if result.Code != http.StatusServiceUnavailable {
+		t.Fatalf("stale health status = %d", result.Code)
+	}
+	a.lastPersist = time.Now()
+	result = httptest.NewRecorder()
+	a.health(result, request)
+	if result.Code != http.StatusOK {
+		t.Fatalf("fresh health status = %d", result.Code)
+	}
+}
+
 func TestLoginRateLimit(t *testing.T) {
 	limiter := newLoginLimiter()
 	for range 5 {
@@ -385,15 +502,19 @@ func TestLoginLimiterStorageIsBounded(t *testing.T) {
 	for i := range 5000 {
 		limiter.failure(string(rune(i + 1)))
 	}
-	if size := len(limiter.attempts); size > 1001 {
+	if size := len(limiter.attempts); size > 1000 {
 		t.Fatalf("limiter contains %d entries", size)
+	}
+	if !limiter.allow("new-client") {
+		t.Fatal("LRU limiter globally blocked unrelated client")
 	}
 }
 
 func TestIncidentPagination(t *testing.T) {
 	a := newTestApp(t)
 	for i := range 51 {
-		_, _ = a.db.Exec(`INSERT INTO incidents(started_at, severity, category, summary, evidence) VALUES (?, 'warning', 'test', ?, '')`, time.Now().Add(time.Duration(i)*time.Second).UTC().Format(time.RFC3339Nano), "test")
+		started := dbTime(time.Now().Add(time.Duration(i) * time.Second))
+		_, _ = a.db.Exec(`INSERT INTO incidents(started_at, ended_at, severity, category, summary, evidence) VALUES (?, ?, 'warning', 'test', ?, '')`, started, started, "test")
 	}
 	first, more, err := incidentPage(context.Background(), a.db, 50, 0)
 	if err != nil || len(first) != 50 || !more {

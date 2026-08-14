@@ -8,6 +8,10 @@ services:
     environment:
       APP_PASSWORD: ${APP_PASSWORD:?set APP_PASSWORD in .env}
       PIHOLE_DNS_ADDR: ${PIHOLE_DNS_ADDR:?set PIHOLE_DNS_ADDR in .env}
+      PUBLIC_DNS_ADDR: ${PUBLIC_DNS_ADDR:-1.1.1.1:53}
+      HTTP_DNS_ADDR: ${HTTP_DNS_ADDR:-${PIHOLE_DNS_ADDR}}
+      HTTP_PROBE_URL: ${HTTP_PROBE_URL:-https://www.google.com/generate_204}
+      TRANSFER_PROBE_URL: ${TRANSFER_PROBE_URL:-https://speed.cloudflare.com/__down?bytes=262144}
       APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Budapest}
       APP_COOKIE_SECURE: ${APP_COOKIE_SECURE:-false}
       APP_LISTEN_ADDR: ${APP_LISTEN_ADDR:-:8080}

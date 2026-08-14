@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,7 +74,7 @@ func (a *App) listExports(ctx context.Context) ([]exportRecord, error) {
 		if err := rows.Scan(&record.ID, &created, &record.RangeName, &record.Path, &size, &record.Status, &record.Error); err != nil {
 			return nil, err
 		}
-		record.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		record.CreatedAt, _ = parseDBTime(created)
 		record.Size = humanBytes(size)
 		records = append(records, record)
 	}
@@ -115,7 +116,7 @@ func (a *App) createExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	job.ID = id[:20]
-	_, err = a.db.ExecContext(r.Context(), `INSERT INTO exports(id, created_at, range_name, path, size, status, error) VALUES (?, ?, ?, '', 0, 'pending', '')`, job.ID, now.UTC().Format(time.RFC3339Nano), rangeName)
+	_, err = a.db.ExecContext(r.Context(), `INSERT INTO exports(id, created_at, range_name, path, size, status, error) VALUES (?, ?, ?, '', 0, 'pending', '')`, job.ID, dbTime(now), rangeName)
 	if err != nil {
 		http.Error(w, "export creation failed", http.StatusInternalServerError)
 		return
@@ -172,23 +173,29 @@ func (a *App) processExport(ctx context.Context, job exportJob) error {
 func (a *App) writeExport(ctx context.Context, zw *zip.Writer, from, to time.Time) error {
 	a.dataMu.RLock()
 	defer a.dataMu.RUnlock()
-	fromText, toText := from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano)
+	tx, err := a.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	fromText, toText := dbTime(from), dbTime(to)
 	var total, successful, warnings, errorCount, criticals int
-	err := a.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(success),0), COALESCE(SUM(severity='warning'),0), COALESCE(SUM(severity='error'),0), COALESCE(SUM(severity='critical'),0) FROM samples WHERE probe_type='aggregate' AND created_at>=? AND created_at<?`, fromText, toText).Scan(&total, &successful, &warnings, &errorCount, &criticals)
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(success),0), COALESCE(SUM(severity='warning'),0), COALESCE(SUM(severity='error'),0), COALESCE(SUM(severity='critical'),0) FROM samples WHERE probe_type='aggregate' AND created_at>=? AND created_at<?`, fromText, toText).Scan(&total, &successful, &warnings, &errorCount, &criticals)
 	if err != nil {
 		return err
 	}
 	var rolledTotal, rolledSuccessful, rolledWarnings, rolledErrors, rolledCriticals int
-	if err := a.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(samples),0), COALESCE(SUM(successes),0), COALESCE(SUM(warnings),0), COALESCE(SUM(errors),0), COALESCE(SUM(criticals),0) FROM quarter_hour_rollups WHERE probe_type='aggregate' AND bucket>=? AND bucket<?`, fromText, toText).Scan(&rolledTotal, &rolledSuccessful, &rolledWarnings, &rolledErrors, &rolledCriticals); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(samples),0), COALESCE(SUM(successes),0), COALESCE(SUM(warnings),0), COALESCE(SUM(errors),0), COALESCE(SUM(criticals),0) FROM quarter_hour_rollups_v2 WHERE probe_type='aggregate' AND bucket>=? AND bucket<?`, fromText, toText).Scan(&rolledTotal, &rolledSuccessful, &rolledWarnings, &rolledErrors, &rolledCriticals); err != nil {
 		return err
 	}
 	total, successful = total+rolledTotal, successful+rolledSuccessful
 	warnings, errorCount, criticals = warnings+rolledWarnings, errorCount+rolledErrors, criticals+rolledCriticals
 	var incidentCount int
-	if err := a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM incidents WHERE started_at<? AND (ended_at IS NULL OR ended_at>?)`, toText, fromText).Scan(&incidentCount); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM incidents WHERE started_at<? AND (ended_at IS NULL OR ended_at>?)`, toText, fromText).Scan(&incidentCount); err != nil {
 		return err
 	}
-	profile, _ := setting(ctx, a.db, "profile")
+	var profile string
+	_ = tx.QueryRowContext(ctx, `SELECT value FROM settings WHERE key='profile'`).Scan(&profile)
 	availability := 100.0
 	if total > 0 {
 		availability = float64(successful) * 100 / float64(total)
@@ -200,23 +207,26 @@ func (a *App) writeExport(ctx context.Context, zw *zip.Writer, from, to time.Tim
 	if err := zipText(zw, "summary.md", summary); err != nil {
 		return err
 	}
-	if err := a.zipSamples(ctx, zw, fromText, toText); err != nil {
+	if err := a.zipSamples(ctx, tx, zw, fromText, toText); err != nil {
 		return err
 	}
-	if err := a.zipIncidents(ctx, zw, fromText, toText); err != nil {
+	if err := a.zipIncidents(ctx, tx, zw, fromText, toText); err != nil {
 		return err
 	}
-	if err := a.zipRollups(ctx, zw, "quarter_hour_rollups", "quarter-hour-rollups.jsonl", fromText, toText); err != nil {
+	if err := a.zipRollups(ctx, tx, zw, "quarter_hour_rollups_v2", "quarter-hour-rollups.jsonl", fromText, toText); err != nil {
 		return err
 	}
-	settings := map[string]any{"profile": profile, "pihole_dns_target": a.cfg.PiHoleAddr, "public_dns_target": a.cfg.PublicDNS, "http_probe_url": a.cfg.HTTPURL, "http_expected_status": a.cfg.HTTPExpectedStatus, "transfer_probe_url": stripQuery(a.cfg.TransferURL), "raw_retention_days": 30, "rollup_retention": "indefinite", "export_retention_days": 7}
+	settings := map[string]any{"profile": profile, "pihole_dns_target": a.cfg.PiHoleAddr, "public_dns_target": a.cfg.PublicDNS, "http_dns_target": a.cfg.HTTPDNSAddr, "http_probe_url": redactURL(a.cfg.HTTPURL), "http_expected_status": a.cfg.HTTPExpectedStatus, "transfer_probe_url": redactURL(a.cfg.TransferURL), "raw_retention_days": 30, "rollup_retention": "indefinite", "export_retention_days": 7}
 	if err := zipJSON(zw, "settings-redacted.json", settings); err != nil {
 		return err
 	}
-	return zipJSON(zw, "system-info.json", map[string]any{"go_version": runtime.Version(), "os": runtime.GOOS, "architecture": runtime.GOARCH, "app_uptime": time.Since(a.startedAt).String()})
+	if err := zipJSON(zw, "system-info.json", map[string]any{"go_version": runtime.Version(), "os": runtime.GOOS, "architecture": runtime.GOARCH, "app_uptime": time.Since(a.startedAt).String()}); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-func (a *App) zipSamples(ctx context.Context, zw *zip.Writer, from, to string) error {
+func (a *App) zipSamples(ctx context.Context, tx *sql.Tx, zw *zip.Writer, from, to string) error {
 	w, err := zw.Create("measurements.jsonl")
 	if err != nil {
 		return err
@@ -225,7 +235,7 @@ func (a *App) zipSamples(ctx context.Context, zw *zip.Writer, from, to string) e
 	encoder = json.NewEncoder(buffer)
 	lastID := int64(0)
 	for {
-		rows, err := a.db.QueryContext(ctx, `SELECT `+sampleColumns+` FROM samples WHERE id>? AND created_at>=? AND created_at<? ORDER BY id LIMIT 5000`, lastID, from, to)
+		rows, err := tx.QueryContext(ctx, `SELECT `+sampleColumns+` FROM samples WHERE id>? AND created_at>=? AND created_at<? ORDER BY id LIMIT 5000`, lastID, from, to)
 		if err != nil {
 			return err
 		}
@@ -254,7 +264,7 @@ func (a *App) zipSamples(ctx context.Context, zw *zip.Writer, from, to string) e
 	return buffer.Flush()
 }
 
-func (a *App) zipIncidents(ctx context.Context, zw *zip.Writer, from, to string) error {
+func (a *App) zipIncidents(ctx context.Context, tx *sql.Tx, zw *zip.Writer, from, to string) error {
 	w, err := zw.Create("incidents.jsonl")
 	if err != nil {
 		return err
@@ -263,7 +273,7 @@ func (a *App) zipIncidents(ctx context.Context, zw *zip.Writer, from, to string)
 	encoder = json.NewEncoder(buffer)
 	lastID := int64(0)
 	for {
-		rows, err := a.db.QueryContext(ctx, `SELECT id, started_at, ended_at, severity, category, summary, evidence FROM incidents WHERE id>? AND started_at<? AND (ended_at IS NULL OR ended_at>?) ORDER BY id LIMIT 1000`, lastID, to, from)
+		rows, err := tx.QueryContext(ctx, `SELECT id, started_at, ended_at, severity, category, summary, evidence FROM incidents WHERE id>? AND started_at<? AND (ended_at IS NULL OR ended_at>?) ORDER BY id LIMIT 1000`, lastID, to, from)
 		if err != nil {
 			return err
 		}
@@ -295,22 +305,26 @@ func (a *App) zipIncidents(ctx context.Context, zw *zip.Writer, from, to string)
 type rollup struct {
 	Bucket        string  `json:"bucket"`
 	ProbeType     string  `json:"probe_type"`
+	Target        string  `json:"target"`
 	Samples       int     `json:"samples"`
 	Successes     int     `json:"successes"`
 	Warnings      int     `json:"warnings"`
 	Errors        int     `json:"errors"`
 	Criticals     int     `json:"criticals"`
 	AvgDurationMS float64 `json:"avg_duration_ms"`
+	AvgDNSMS      float64 `json:"avg_dns_ms"`
+	AvgConnectMS  float64 `json:"avg_connect_ms"`
+	AvgTLSMS      float64 `json:"avg_tls_ms"`
 	AvgTTFBMS     float64 `json:"avg_ttfb_ms"`
 	AvgMbps       float64 `json:"avg_mbps"`
 }
 
-func (a *App) zipRollups(ctx context.Context, zw *zip.Writer, table, name, from, to string) error {
+func (a *App) zipRollups(ctx context.Context, tx *sql.Tx, zw *zip.Writer, table, name, from, to string) error {
 	w, err := zw.Create(name)
 	if err != nil {
 		return err
 	}
-	rows, err := a.db.QueryContext(ctx, `SELECT bucket, probe_type, samples, successes, warnings, errors, criticals, avg_duration_ms, avg_ttfb_ms, avg_mbps FROM `+table+` WHERE bucket>=? AND bucket<? ORDER BY bucket`, from, to)
+	rows, err := tx.QueryContext(ctx, `SELECT bucket, probe_type, target, samples, successes, warnings, errors, criticals, avg_duration_ms, avg_dns_ms, avg_connect_ms, avg_tls_ms, avg_ttfb_ms, avg_mbps FROM `+table+` WHERE bucket>=? AND bucket<? ORDER BY bucket`, from, to)
 	if err != nil {
 		return err
 	}
@@ -318,7 +332,7 @@ func (a *App) zipRollups(ctx context.Context, zw *zip.Writer, table, name, from,
 	encoder := json.NewEncoder(w)
 	for rows.Next() {
 		var value rollup
-		if err := rows.Scan(&value.Bucket, &value.ProbeType, &value.Samples, &value.Successes, &value.Warnings, &value.Errors, &value.Criticals, &value.AvgDurationMS, &value.AvgTTFBMS, &value.AvgMbps); err != nil {
+		if err := rows.Scan(&value.Bucket, &value.ProbeType, &value.Target, &value.Samples, &value.Successes, &value.Warnings, &value.Errors, &value.Criticals, &value.AvgDurationMS, &value.AvgDNSMS, &value.AvgConnectMS, &value.AvgTLSMS, &value.AvgTTFBMS, &value.AvgMbps); err != nil {
 			return err
 		}
 		if err := encoder.Encode(value); err != nil {
@@ -372,10 +386,4 @@ func humanBytes(size int64) string {
 		return fmt.Sprintf("%.1f KB", float64(size)/1024)
 	}
 	return fmt.Sprintf("%d B", size)
-}
-func stripQuery(value string) string {
-	if index := strings.IndexByte(value, '?'); index >= 0 {
-		return value[:index]
-	}
-	return value
 }
