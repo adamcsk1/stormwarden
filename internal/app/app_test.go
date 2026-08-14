@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -16,6 +17,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 func newTestApp(t *testing.T) *App {
@@ -66,10 +69,84 @@ func TestDNSResponseValidation(t *testing.T) {
 	if err := validateDNSResponse(empty, query, 42); err == nil {
 		t.Fatal("zero-answer response accepted")
 	}
+	nxdomain := negativeDNSResponse(t, query, dnsmessage.RCodeNameError)
+	if err := validateDNSResponse(nxdomain, query, 42); err != nil {
+		t.Fatalf("valid NXDOMAIN rejected: %v", err)
+	}
+	var request dnsmessage.Message
+	_ = request.Unpack(query)
+	referral := dnsmessage.Message{Header: dnsmessage.Header{ID: 42, Response: true, RecursionAvailable: true}, Questions: request.Questions, Authorities: []dnsmessage.Resource{{Header: dnsmessage.ResourceHeader{Name: request.Questions[0].Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}, Body: &dnsmessage.AResource{A: [4]byte{1, 2, 3, 4}}}}}
+	referralBytes, _ := referral.Pack()
+	if err := validateDNSResponse(referralBytes, query, 42); err == nil {
+		t.Fatal("referral accepted as negative answer")
+	}
 	valid := append(empty, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4)
 	binary.BigEndian.PutUint16(valid[6:8], 1)
 	if err := validateDNSResponse(valid, query, 42); err != nil {
 		t.Fatalf("valid response rejected: %v", err)
+	}
+}
+
+func negativeDNSResponse(t *testing.T, query []byte, rcode dnsmessage.RCode) []byte {
+	t.Helper()
+	var request dnsmessage.Message
+	if err := request.Unpack(query); err != nil {
+		t.Fatal(err)
+	}
+	ns, _ := dnsmessage.NewName("ns.example.com.")
+	mailbox, _ := dnsmessage.NewName("hostmaster.example.com.")
+	response := dnsmessage.Message{
+		Header:      dnsmessage.Header{ID: request.Header.ID, Response: true, RecursionAvailable: true, RCode: rcode},
+		Questions:   request.Questions,
+		Authorities: []dnsmessage.Resource{{Header: dnsmessage.ResourceHeader{Name: request.Questions[0].Name, Type: dnsmessage.TypeSOA, Class: dnsmessage.ClassINET, TTL: 60}, Body: &dnsmessage.SOAResource{NS: ns, MBox: mailbox, Serial: 1, Refresh: 60, Retry: 60, Expire: 60, MinTTL: 60}}},
+	}
+	packed, err := response.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return packed
+}
+
+func TestDNSQueriesBypassCache(t *testing.T) {
+	_, first, err := newDNSQuery()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, second, err := newDNSQuery()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(first[12:], second[12:]) {
+		t.Fatal("DNS probe names were reused")
+	}
+	if !bytes.Contains(first, []byte("example")) {
+		t.Fatal("DNS probe does not use expected domain")
+	}
+}
+
+func TestDoHProbeAcceptsNXDOMAIN(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query, _ := io.ReadAll(r.Body)
+		response := negativeDNSResponse(t, query, dnsmessage.RCodeNameError)
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(response)
+	}))
+	defer server.Close()
+	sample := probeDoH(context.Background(), "direct-doh", server.URL)
+	if !sample.Success || sample.ProbeType != "doh" || !strings.Contains(sample.Message, "NXDOMAIN") {
+		t.Fatalf("DoH result: %+v", sample)
+	}
+}
+
+func TestDoHProbeValidatesHTTPResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer server.Close()
+	sample := probeDoH(context.Background(), "direct-doh", server.URL)
+	if sample.Success || sample.DurationMS <= 0 || sample.StatusCode != http.StatusBadGateway {
+		t.Fatalf("invalid DoH HTTP result: %+v", sample)
 	}
 }
 
@@ -167,12 +244,57 @@ func TestAggregateCriticalAfterConsecutiveFailures(t *testing.T) {
 	failure := func(target string) Sample {
 		return Sample{ProbeType: "tcp", Target: target, Severity: Error, Message: "failed"}
 	}
-	samples := []Sample{failure("pihole"), failure("public-dns"), failure("internet-tcp")}
+	samples := []Sample{failure("pihole"), failure("pihole-udp"), failure("public-dns"), failure("direct-doh"), failure("internet-tcp")}
 	if got := a.aggregateSample(samples); got.Severity != Error {
 		t.Fatalf("first cycle = %s", got.Severity)
 	}
 	if got := a.aggregateSample(samples); got.Severity != Critical || got.Success {
 		t.Fatalf("second cycle = %+v", got)
+	}
+}
+
+func TestDiagnosisIdentifiesUDPInstability(t *testing.T) {
+	a := newTestApp(t)
+	samples := []Sample{
+		{ProbeType: "dns", Target: "pihole", Severity: Error, Message: "failed"},
+		{ProbeType: "dns", Target: "pihole-udp", Severity: Error, Message: "failed"},
+		{ProbeType: "dns", Target: "public-dns", Severity: Error, Message: "failed"},
+		{ProbeType: "doh", Target: "direct-doh", Severity: Info, Success: true, Message: "healthy"},
+		{ProbeType: "tcp", Target: "internet-tcp", Severity: Info, Success: true, Message: "healthy"},
+	}
+	_, issues, _ := a.diagnoseSamples(samples)
+	found := false
+	for _, issue := range issues {
+		if issue.Target == "direct_udp_path" && issue.Severity == Error {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("UDP instability not diagnosed: %+v", issues)
+	}
+}
+
+func TestDiagnosisReportsSlowSuccessfulDNSPath(t *testing.T) {
+	a := newTestApp(t)
+	samples := []Sample{
+		{ProbeType: "dns", Target: "pihole", Severity: Info, Success: true},
+		{ProbeType: "dns", Target: "pihole-udp", Severity: Warning, Success: true, Message: "DNS response above 250 ms"},
+		{ProbeType: "dns", Target: "public-dns", Severity: Info, Success: true},
+		{ProbeType: "doh", Target: "direct-doh", Severity: Info, Success: true},
+		{ProbeType: "tcp", Target: "internet-tcp", Severity: Info, Success: true},
+	}
+	aggregate, issues, _ := a.diagnoseSamples(samples)
+	if !aggregate.Success || aggregate.Severity != Warning {
+		t.Fatalf("aggregate result: %+v", aggregate)
+	}
+	found := false
+	for _, issue := range issues {
+		if issue.Target == "pihole_udp_path" && issue.Severity == Warning {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("slow successful path omitted: %+v", issues)
 	}
 }
 
@@ -401,7 +523,7 @@ func TestExportContainsBoundedAIData(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	wanted := map[string]bool{"summary.md": false, "measurements.jsonl": false, "incidents.jsonl": false, "quarter-hour-rollups.jsonl": false, "settings-redacted.json": false}
+	wanted := map[string]bool{"summary.md": false, "measurements.jsonl": false, "incidents.jsonl": false, "dns-path-summary.json": false, "quarter-hour-rollups.jsonl": false, "settings-redacted.json": false}
 	for _, file := range reader.File {
 		if _, ok := wanted[file.Name]; ok {
 			wanted[file.Name] = true
@@ -427,6 +549,27 @@ func TestExportContainsBoundedAIData(t *testing.T) {
 		if !found {
 			t.Errorf("export missing %s", name)
 		}
+	}
+}
+
+func TestDNSPathSummaryIncludesRetainedRollups(t *testing.T) {
+	a := newTestApp(t)
+	bucket := dbTime(time.Now().Add(-40 * 24 * time.Hour).Truncate(15 * time.Minute))
+	_, err := a.db.Exec(`INSERT INTO quarter_hour_rollups_v2(bucket, probe_type, target, samples, successes, warnings, errors, criticals, avg_duration_ms, avg_dns_ms, avg_connect_ms, avg_tls_ms, avg_ttfb_ms, avg_mbps) VALUES (?, 'dns', 'pihole', 10, 8, 1, 1, 0, 20, 20, 0, 0, 0, 0)`, bucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := a.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	summaries, err := loadDNSPathSummaries(context.Background(), tx, dbTime(time.Now().Add(-50*24*time.Hour)), dbTime(time.Now()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || summaries[0].Samples != 10 || summaries[0].Successes != 8 || summaries[0].AvgDurationMS != 20 {
+		t.Fatalf("rollup summary: %+v", summaries)
 	}
 }
 
@@ -536,5 +679,31 @@ func TestIncidentPaginationDisplaysOneBasedPage(t *testing.T) {
 	body := result.Body.String()
 	if !strings.Contains(body, "Page 1") || strings.Contains(body, "Page 0") {
 		t.Fatalf("unexpected pagination: %s", body)
+	}
+}
+
+func TestDNSPathFragmentShowsAllControls(t *testing.T) {
+	a := newTestApp(t)
+	for _, target := range []string{"pihole", "pihole-udp", "public-dns", "direct-doh"} {
+		if err := insertSample(context.Background(), a.db, Sample{CreatedAt: time.Now(), ProbeType: "dns", Target: target, Severity: Info, Success: true, DurationMS: 12, Message: "healthy"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result := httptest.NewRecorder()
+	a.dnsPathsFragment(result, httptest.NewRequest(http.MethodGet, "/ui/dns-paths", nil))
+	body := result.Body.String()
+	for _, label := range []string{"Pi-hole TCP", "Pi-hole UDP", "Direct UDP", "Direct DoH"} {
+		if !strings.Contains(body, label) {
+			t.Fatalf("DNS path fragment missing %s: %s", label, body)
+		}
+	}
+}
+
+func TestDNSPathFragmentMarksStaleSamples(t *testing.T) {
+	a := newTestApp(t)
+	result := httptest.NewRecorder()
+	a.render(result, "dns-paths.html", map[string]any{"Paths": []dnsPathView{{Label: "Direct DoH", Sample: &Sample{CreatedAt: time.Now().Add(-time.Minute), Severity: Info}, Stale: true}}})
+	if !strings.Contains(result.Body.String(), ">stale<") {
+		t.Fatalf("stale state missing: %s", result.Body.String())
 	}
 }

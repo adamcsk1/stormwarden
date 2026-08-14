@@ -329,6 +329,17 @@ func latestSampleTime(ctx context.Context, db *sql.DB, probeType string) (time.T
 	return parseDBTime(value)
 }
 
+func latestSampleByTarget(ctx context.Context, db *sql.DB, target string) (*Sample, error) {
+	sample, err := scanSample(db.QueryRowContext(ctx, `SELECT `+sampleColumns+` FROM samples WHERE target=? ORDER BY id DESC LIMIT 1`, target))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &sample, nil
+}
+
 func setting(ctx context.Context, db *sql.DB, key string) (string, error) {
 	var value string
 	err := db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, key).Scan(&value)

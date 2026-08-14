@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 )
@@ -200,7 +201,7 @@ func (a *App) writeExport(ctx context.Context, zw *zip.Writer, from, to time.Tim
 	if total > 0 {
 		availability = float64(successful) * 100 / float64(total)
 	}
-	summary := fmt.Sprintf("# Stormwarden Diagnostic Report\n\nObservation period: %s to %s\nGenerated: %s\nTraffic profile: %s\n\n## Summary\n\n- Health cycles: %d\n- Availability: %.2f%%\n- Warning cycles: %d\n- Error cycles: %d\n- Critical cycles: %d\n- Incidents: %d\n\n## Interpretation\n\nCompare Pi-hole DNS with public DNS samples to isolate local resolver failures. HTTP records split DNS, TCP connect, TLS, time-to-first-byte, body transfer speed, and total duration. Aggregate records represent household connectivity per probe cycle.\n\n## Privacy\n\nAuthentication secrets, sessions, cookies, headers, and DNS answers are excluded. Configured targets remain because diagnosis requires them.\n", from.In(a.cfg.Timezone).Format(time.RFC3339), to.In(a.cfg.Timezone).Format(time.RFC3339), time.Now().In(a.cfg.Timezone).Format(time.RFC3339), profile, total, availability, warnings, errorCount, criticals, incidentCount)
+	summary := fmt.Sprintf("# Stormwarden Diagnostic Report\n\nObservation period: %s to %s\nGenerated: %s\nTraffic profile: %s\n\n## Summary\n\n- Health cycles: %d\n- Availability: %.2f%%\n- Warning cycles: %d\n- Error cycles: %d\n- Critical cycles: %d\n- Incidents: %d\n\n## Interpretation\n\nCompare observed behavior across Pi-hole TCP, Pi-hole UDP, direct DNS-over-UDP, and direct DNS-over-HTTPS paths. Queries use randomized subdomains to bypass caches; path differences are evidence, not proof of a specific underlying transport cause. HTTP records split DNS, TCP connect, TLS, time-to-first-byte, body transfer speed, and total duration. Aggregate records represent household connectivity per probe cycle.\n\n## Privacy\n\nAuthentication secrets, sessions, cookies, headers, and DNS answers are excluded. Configured targets remain because diagnosis requires them.\n", from.In(a.cfg.Timezone).Format(time.RFC3339), to.In(a.cfg.Timezone).Format(time.RFC3339), time.Now().In(a.cfg.Timezone).Format(time.RFC3339), profile, total, availability, warnings, errorCount, criticals, incidentCount)
 	if err := zipText(zw, "README.md", "Use summary.md for an overview and the JSONL files for detailed analysis. JSONL contains one JSON object per line. Raw data retains 30 days; rollups preserve older trends.\n"); err != nil {
 		return err
 	}
@@ -213,10 +214,17 @@ func (a *App) writeExport(ctx context.Context, zw *zip.Writer, from, to time.Tim
 	if err := a.zipIncidents(ctx, tx, zw, fromText, toText); err != nil {
 		return err
 	}
+	dnsPaths, err := loadDNSPathSummaries(ctx, tx, fromText, toText)
+	if err != nil {
+		return err
+	}
+	if err := zipJSON(zw, "dns-path-summary.json", dnsPaths); err != nil {
+		return err
+	}
 	if err := a.zipRollups(ctx, tx, zw, "quarter_hour_rollups_v2", "quarter-hour-rollups.jsonl", fromText, toText); err != nil {
 		return err
 	}
-	settings := map[string]any{"profile": profile, "pihole_dns_target": a.cfg.PiHoleAddr, "public_dns_target": a.cfg.PublicDNS, "http_dns_target": a.cfg.HTTPDNSAddr, "http_probe_url": redactURL(a.cfg.HTTPURL), "http_expected_status": a.cfg.HTTPExpectedStatus, "transfer_probe_url": redactURL(a.cfg.TransferURL), "raw_retention_days": 30, "rollup_retention": "indefinite", "export_retention_days": 7}
+	settings := map[string]any{"profile": profile, "pihole_dns_target": a.cfg.PiHoleAddr, "public_dns_target": a.cfg.PublicDNS, "doh_probe_url": redactURL(a.cfg.DoHURL), "http_dns_target": a.cfg.HTTPDNSAddr, "http_probe_url": redactURL(a.cfg.HTTPURL), "http_expected_status": a.cfg.HTTPExpectedStatus, "transfer_probe_url": redactURL(a.cfg.TransferURL), "raw_retention_days": 30, "rollup_retention": "indefinite", "export_retention_days": 7}
 	if err := zipJSON(zw, "settings-redacted.json", settings); err != nil {
 		return err
 	}
@@ -317,6 +325,61 @@ type rollup struct {
 	AvgTLSMS      float64 `json:"avg_tls_ms"`
 	AvgTTFBMS     float64 `json:"avg_ttfb_ms"`
 	AvgMbps       float64 `json:"avg_mbps"`
+}
+
+type dnsPathSummary struct {
+	Target        string  `json:"target"`
+	Samples       int     `json:"samples"`
+	Successes     int     `json:"successes"`
+	AvgDurationMS float64 `json:"avg_duration_ms"`
+}
+
+func loadDNSPathSummaries(ctx context.Context, tx *sql.Tx, from, to string) ([]dnsPathSummary, error) {
+	type accumulator struct {
+		samples, successes int
+		totalDuration      float64
+	}
+	values := make(map[string]accumulator)
+	queries := []string{
+		`SELECT target, COUNT(*), SUM(success), SUM(duration_ms) FROM samples WHERE target IN ('pihole','pihole-udp','public-dns','direct-doh') AND created_at>=? AND created_at<? GROUP BY target`,
+		`SELECT target, SUM(samples), SUM(successes), SUM(avg_duration_ms*samples) FROM quarter_hour_rollups_v2 WHERE target IN ('pihole','pihole-udp','public-dns','direct-doh') AND bucket>=? AND bucket<? GROUP BY target`,
+	}
+	for _, query := range queries {
+		rows, err := tx.QueryContext(ctx, query, from, to)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var target string
+			var samples, successes int
+			var totalDuration float64
+			if err := rows.Scan(&target, &samples, &successes, &totalDuration); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			value := values[target]
+			value.samples, value.successes, value.totalDuration = value.samples+samples, value.successes+successes, value.totalDuration+totalDuration
+			values[target] = value
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	keys := make([]string, 0, len(values))
+	for target := range values {
+		keys = append(keys, target)
+	}
+	sort.Strings(keys)
+	result := make([]dnsPathSummary, 0, len(keys))
+	for _, target := range keys {
+		value := values[target]
+		average := 0.0
+		if value.samples > 0 {
+			average = value.totalDuration / float64(value.samples)
+		}
+		result = append(result, dnsPathSummary{Target: target, Samples: value.samples, Successes: value.successes, AvgDurationMS: average})
+	}
+	return result, nil
 }
 
 func (a *App) zipRollups(ctx context.Context, tx *sql.Tx, zw *zip.Writer, table, name, from, to string) error {

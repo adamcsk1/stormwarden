@@ -207,6 +207,7 @@ func (a *App) runProbeCycle(ctx context.Context) {
 		{ProbeType: "dns", Target: "pihole", Run: func(probeCtx context.Context) Sample { return probeDNSTCP(probeCtx, "pihole", a.cfg.PiHoleAddr) }},
 		{ProbeType: "dns", Target: "pihole-udp", Run: func(probeCtx context.Context) Sample { return probeDNS(probeCtx, "pihole-udp", a.cfg.PiHoleAddr) }},
 		{ProbeType: "dns", Target: "public-dns", Run: func(probeCtx context.Context) Sample { return probeDNS(probeCtx, "public-dns", a.cfg.PublicDNS) }},
+		{ProbeType: "doh", Target: "direct-doh", Run: func(probeCtx context.Context) Sample { return probeDoH(probeCtx, "direct-doh", a.cfg.DoHURL) }},
 		{ProbeType: "tcp", Target: "internet-tcp", Run: func(probeCtx context.Context) Sample { return probeTCP(probeCtx, "internet-tcp", "1.1.1.1:443") }},
 		{ProbeType: "http", Target: "http", Run: func(probeCtx context.Context) Sample {
 			return probeHTTPStatusResolver(probeCtx, "http", a.cfg.HTTPURL, 512, a.cfg.HTTPExpectedStatus, a.cfg.HTTPDNSAddr)
@@ -271,23 +272,42 @@ func (a *App) diagnoseSamples(samples []Sample) (Sample, []Sample, map[string]bo
 	pihole, hasPiHole := byTarget["pihole"]
 	piholeUDP, hasPiHoleUDP := byTarget["pihole-udp"]
 	publicDNS, hasPublic := byTarget["public-dns"]
+	doh, hasDoH := byTarget["direct-doh"]
 	tcp, hasTCP := byTarget["internet-tcp"]
 	var issues []Sample
 	observed := map[string]bool{
-		"local_dns": hasPiHole, "external_dns": hasPiHole && hasPublic, "udp_dns": hasPiHoleUDP,
-		"tcp_connect": hasTCP, "internet_outage": hasPiHole && hasPublic && hasTCP,
+		"local_dns": hasPiHole && hasPiHoleUDP, "external_dns": hasPiHole && hasPiHoleUDP && hasPublic && hasDoH,
+		"pihole_udp_path": hasPiHoleUDP, "pihole_tcp_path": hasPiHole,
+		"direct_udp_path": hasPublic && hasDoH, "direct_doh_path": hasPublic && hasDoH,
+		"tcp_connect": hasTCP, "internet_outage": hasPiHole && hasPublic && hasDoH && hasTCP,
 		"slow_ttfb": hasHTTP, "tls_handshake": hasHTTP, "internet_connectivity": hasHTTP,
 		"slow_transfer": hasTransfer,
 	}
-	if hasPiHole && pihole.Severity != Info {
+	if hasPiHole && hasPiHoleUDP && !pihole.Success && !piholeUDP.Success {
 		category := "local_dns"
-		if hasPublic && !publicDNS.Success {
+		if hasPublic && hasDoH && !publicDNS.Success && !doh.Success {
 			category = "external_dns"
 		}
 		issues = append(issues, incidentSample(pihole, category))
+	} else if hasPiHoleUDP && piholeUDP.Severity != Info {
+		issue := incidentSample(piholeUDP, "pihole_udp_path")
+		issue.Message = "Pi-hole UDP path degraded: " + piholeUDP.Message
+		issues = append(issues, issue)
 	}
-	if hasPiHoleUDP && piholeUDP.Severity != Info {
-		issues = append(issues, incidentSample(piholeUDP, "udp_dns"))
+	if hasPiHole && pihole.Severity != Info && !(hasPiHoleUDP && !pihole.Success && !piholeUDP.Success) {
+		issue := incidentSample(pihole, "pihole_tcp_path")
+		issue.Message = "Pi-hole TCP path degraded: " + pihole.Message
+		issues = append(issues, issue)
+	}
+	if hasPublic && publicDNS.Severity != Info {
+		issue := incidentSample(publicDNS, "direct_udp_path")
+		issue.Message = "Direct UDP DNS path degraded: " + publicDNS.Message
+		issues = append(issues, issue)
+	}
+	if hasDoH && doh.Severity != Info {
+		issue := incidentSample(doh, "direct_doh_path")
+		issue.Message = "Direct DoH path degraded: " + doh.Message
+		issues = append(issues, issue)
 	}
 	if hasTCP && tcp.Severity != Info {
 		issues = append(issues, incidentSample(tcp, "tcp_connect"))
@@ -298,7 +318,7 @@ func (a *App) diagnoseSamples(samples []Sample) (Sample, []Sample, map[string]bo
 	if hasTransfer && transfer.Severity != Info {
 		issues = append(issues, incidentSample(transfer, "slow_transfer"))
 	}
-	outageEvidence := hasPiHole && hasPublic && hasTCP && !pihole.Success && !publicDNS.Success && !tcp.Success
+	outageEvidence := hasPiHole && hasPiHoleUDP && hasPublic && hasDoH && hasTCP && !pihole.Success && !piholeUDP.Success && !publicDNS.Success && !doh.Success && !tcp.Success
 	if outageEvidence {
 		a.criticalCycles++
 	} else {
@@ -306,10 +326,11 @@ func (a *App) diagnoseSamples(samples []Sample) (Sample, []Sample, map[string]bo
 	}
 	if a.criticalCycles >= 2 {
 		critical := incidentSample(tcp, "internet_outage")
-		critical.Severity, critical.Message = Critical, "Pi-hole DNS, public DNS, and direct TCP failed for consecutive cycles"
+		critical.Severity, critical.Message = Critical, "Pi-hole DNS, direct UDP DNS, DNS-over-HTTPS, and direct TCP failed for consecutive cycles"
 		issues = append(issues, critical)
 	}
-	available := (!hasPiHole || pihole.Success) && (!hasTCP || tcp.Success) && (!hasHTTP || httpSample.Success)
+	dnsAvailable := (!hasPiHoleUDP && (!hasPiHole || pihole.Success)) || (hasPiHoleUDP && piholeUDP.Success)
+	available := dnsAvailable && (!hasTCP || tcp.Success) && (!hasHTTP || httpSample.Success)
 	for _, issue := range issues {
 		if severityRank(issue.Severity) > severityRank(aggregate.Severity) {
 			aggregate = issue
