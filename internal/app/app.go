@@ -35,6 +35,9 @@ type App struct {
 	exportJobs         chan exportJob
 	loginLimiter       *loginLimiter
 	piholeAPI          *piHoleAPIClient
+	piholeHealthMu     sync.RWMutex
+	piholeHealth       piHoleHealthStatus
+	piholeCheck        *piHoleHealthCheck
 }
 
 type probeFunc struct {

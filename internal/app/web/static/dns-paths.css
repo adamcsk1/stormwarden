@@ -30,6 +30,8 @@
 
 .dns-path .badge {
   align-self: start;
+  justify-self: start;
+  width: max-content;
 }
 
 .dns-path small {

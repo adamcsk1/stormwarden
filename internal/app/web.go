@@ -153,6 +153,7 @@ func (a *App) routes() http.Handler {
 	mux.Handle("GET /ui/incidents", a.requireAuth(http.HandlerFunc(a.incidentsFragment)))
 	mux.Handle("GET /ui/settings", a.requireAuth(http.HandlerFunc(a.settingsFragment)))
 	mux.Handle("POST /ui/settings", a.requireAuth(http.HandlerFunc(a.saveSettings)))
+	mux.Handle("POST /ui/pihole-api-health", a.requireAuth(http.HandlerFunc(a.checkPiHoleAPIHealth)))
 	mux.Handle("GET /ui/exports", a.requireAuth(http.HandlerFunc(a.exportsFragment)))
 	mux.Handle("POST /ui/exports", a.requireAuth(http.HandlerFunc(a.createExport)))
 	mux.Handle("GET /exports/{id}/download", a.requireAuth(http.HandlerFunc(a.downloadExport)))
@@ -389,7 +390,97 @@ func (a *App) settingsFragment(w http.ResponseWriter, r *http.Request) {
 	profile, _ := setting(r.Context(), a.db, "profile")
 	assetTargets, _ := setting(r.Context(), a.db, "asset_targets")
 	s := r.Context().Value(sessionContextKey).(session)
-	a.render(w, "settings.html", map[string]any{"Profile": profile, "AssetTargets": assetTargets, "CSRF": s.CSRF, "Saved": r.URL.Query().Get("saved") != ""})
+	a.render(w, "settings.html", map[string]any{"Profile": profile, "AssetTargets": assetTargets, "CSRF": s.CSRF, "Saved": r.URL.Query().Get("saved") != "", "PiHoleHealth": a.piHoleHealthView(s.CSRF)})
+}
+
+type piHoleHealthView struct {
+	Configured bool
+	State      string
+	Severity   string
+	Message    string
+	CheckedAt  time.Time
+	HasChecked bool
+	Checking   bool
+	CSRF       string
+}
+
+func (a *App) piHoleHealthView(csrf string) piHoleHealthView {
+	view := piHoleHealthView{CSRF: csrf}
+	if a.piholeAPI == nil {
+		view.State, view.Severity, view.Message = "Not configured", "warning", "Set PIHOLE_API_URL and PIHOLE_API_PASSWORD, then restart Stormwarden."
+		return view
+	}
+	a.piholeHealthMu.RLock()
+	status := a.piholeHealth
+	a.piholeHealthMu.RUnlock()
+	return a.piHoleHealthViewForStatus(csrf, status)
+}
+
+func (a *App) piHoleHealthViewForStatus(csrf string, status piHoleHealthStatus) piHoleHealthView {
+	view := piHoleHealthView{Configured: true, CSRF: csrf}
+	view.CheckedAt, view.HasChecked = status.CheckedAt, !status.CheckedAt.IsZero()
+	switch status.State {
+	case "checking":
+		view.Checking = true
+		view.State, view.Severity, view.Message = "Checking", "warning", "Contacting Pi-hole API..."
+	case "healthy":
+		view.State, view.Severity, view.Message = "Healthy", "info", status.Message
+	case "failed":
+		view.State, view.Severity, view.Message = "Failed", "error", status.Message
+	default:
+		view.State, view.Severity, view.Message = "Not checked", "info", "Run a manual check to verify API authentication and FTL health."
+	}
+	return view
+}
+
+func (a *App) checkPiHoleAPIHealth(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	if err := r.ParseForm(); err != nil || !a.validCSRF(r) {
+		http.Error(w, "invalid request", http.StatusForbidden)
+		return
+	}
+	s := r.Context().Value(sessionContextKey).(session)
+	if a.piholeAPI == nil {
+		a.render(w, "pihole-api-health-content.html", a.piHoleHealthView(s.CSRF))
+		return
+	}
+	a.piholeHealthMu.Lock()
+	if a.piholeCheck != nil {
+		check := a.piholeCheck
+		check.waiters++
+		a.piholeHealthMu.Unlock()
+		defer func() {
+			a.piholeHealthMu.Lock()
+			check.waiters--
+			a.piholeHealthMu.Unlock()
+		}()
+		select {
+		case <-r.Context().Done():
+			return
+		case <-check.done:
+		}
+		a.render(w, "pihole-api-health-content.html", a.piHoleHealthViewForStatus(s.CSRF, check.status))
+		return
+	}
+	check := &piHoleHealthCheck{done: make(chan struct{})}
+	a.piholeCheck = check
+	a.piholeHealth.State, a.piholeHealth.Message = "checking", ""
+	a.piholeHealthMu.Unlock()
+	checkCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	message, err := a.piholeAPI.checkHealth(checkCtx)
+	checkedAt := time.Now()
+	status := piHoleHealthStatus{State: "healthy", Message: message, CheckedAt: checkedAt}
+	if err != nil {
+		status.State, status.Message = "failed", "Pi-hole API check failed: "+err.Error()
+	}
+	a.piholeHealthMu.Lock()
+	a.piholeHealth = status
+	check.status = status
+	a.piholeCheck = nil
+	close(check.done)
+	a.piholeHealthMu.Unlock()
+	a.render(w, "pihole-api-health-content.html", a.piHoleHealthViewForStatus(s.CSRF, status))
 }
 
 func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) {
