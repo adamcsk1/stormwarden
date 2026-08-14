@@ -20,7 +20,7 @@ Probe traffic profiles are selectable in UI:
 
 ## Run
 
-Linux host networking is recommended so container sees same network path as house infrastructure.
+Compose publishes the web interface on port `8080` by default. Set `APP_PORT` in `.env` to use another host port.
 
 ```sh
 cp .env.example .env
@@ -45,7 +45,7 @@ For HTTPS behind reverse proxy, set `APP_COOKIE_SECURE=true`. Do not expose plai
 | `TRANSFER_PROBE_URL` | Cloudflare speed endpoint | Bounded transfer target |
 | `APP_TIMEZONE` | `Europe/Budapest` | Display timezone |
 | `APP_COOKIE_SECURE` | `false` | Require HTTPS session cookies |
-| `APP_LISTEN_ADDR` | `:8080` | HTTP listen address; Docker health check follows its port |
+| `APP_PORT` | `8080` | Host port published by Docker Compose |
 | `DATA_PATH` | `/data/stormwarden.db` | SQLite location in image |
 | `EXPORT_DIR` | `/data/exports` | Generated reports |
 
