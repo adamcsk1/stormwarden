@@ -3,7 +3,8 @@ name: stormwarden
 services:
   stormwarden:
     build: .
-    network_mode: host
+    ports:
+      - "${APP_PORT:-8080}:8080"
     restart: unless-stopped
     environment:
       APP_PASSWORD: ${APP_PASSWORD:?set APP_PASSWORD in .env}
@@ -14,7 +15,7 @@ services:
       TRANSFER_PROBE_URL: ${TRANSFER_PROBE_URL:-https://speed.cloudflare.com/__down?bytes=262144}
       APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Budapest}
       APP_COOKIE_SECURE: ${APP_COOKIE_SECURE:-false}
-      APP_LISTEN_ADDR: ${APP_LISTEN_ADDR:-:8080}
+      APP_LISTEN_ADDR: :8080
       HTTP_EXPECTED_STATUS: ${HTTP_EXPECTED_STATUS:-204}
     volumes:
       - stormwarden-data:/data
