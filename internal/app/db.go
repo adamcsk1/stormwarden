@@ -484,7 +484,11 @@ func incidentEvidence(s Sample) string {
 	if at.IsZero() {
 		at = time.Now()
 	}
-	return fmt.Sprintf("%s event_severity=%s target=%s duration=%.0fms dns=%.0fms connect=%.0fms tls=%.0fms ttfb=%.0fms throughput=%.2fMbps message=%s", at.UTC().Format(time.RFC3339), s.Severity, s.Target, s.DurationMS, s.DNSMS, s.ConnectMS, s.TLSMS, s.TTFBMS, s.Mbps, s.Message)
+	evidence := fmt.Sprintf("%s event_severity=%s target=%s duration=%.0fms dns=%.0fms connect=%.0fms tls=%.0fms ttfb=%.0fms throughput=%.2fMbps message=%s", at.UTC().Format(time.RFC3339), s.Severity, s.Target, s.DurationMS, s.DNSMS, s.ConnectMS, s.TLSMS, s.TTFBMS, s.Mbps, s.Message)
+	if s.incidentContext != "" {
+		evidence += "\n" + s.incidentContext
+	}
+	return evidence
 }
 
 func cleanup(ctx context.Context, db *sql.DB, rawRetention time.Duration) error {

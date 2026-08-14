@@ -2,8 +2,10 @@ package app
 
 import (
 	"errors"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -13,6 +15,8 @@ type Config struct {
 	DataPath           string
 	ExportDir          string
 	PiHoleAddr         string
+	PiHoleAPIURL       string
+	PiHoleAPIPassword  string
 	PublicDNS          string
 	DoHURL             string
 	AssetTargets       string
@@ -37,6 +41,10 @@ func LoadConfig() (Config, error) {
 	if err != nil {
 		return Config{}, errors.New("APP_COOKIE_SECURE must be true or false")
 	}
+	allowInsecurePiHoleAPI, err := strconv.ParseBool(env("PIHOLE_API_ALLOW_INSECURE_HTTP", "false"))
+	if err != nil {
+		return Config{}, errors.New("PIHOLE_API_ALLOW_INSECURE_HTTP must be true or false")
+	}
 	expectedStatus, err := strconv.Atoi(env("HTTP_EXPECTED_STATUS", "204"))
 	if err != nil || expectedStatus < 0 || expectedStatus > 599 || (expectedStatus > 0 && expectedStatus < 100) {
 		return Config{}, errors.New("HTTP_EXPECTED_STATUS must be 0 or a valid HTTP status")
@@ -46,12 +54,28 @@ func LoadConfig() (Config, error) {
 	if _, err := parseAssetTargets(assetTargets); err != nil {
 		return Config{}, err
 	}
+	piholeAPIURL := strings.TrimRight(os.Getenv("PIHOLE_API_URL"), "/")
+	piholeAPIPassword := os.Getenv("PIHOLE_API_PASSWORD")
+	if (piholeAPIURL == "") != (piholeAPIPassword == "") {
+		return Config{}, errors.New("PIHOLE_API_URL and PIHOLE_API_PASSWORD must be set together")
+	}
+	if piholeAPIURL != "" {
+		parsed, err := url.Parse(piholeAPIURL)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return Config{}, errors.New("PIHOLE_API_URL must be an HTTP(S) URL without credentials, query, or fragment")
+		}
+		if parsed.Scheme == "http" && !allowInsecurePiHoleAPI {
+			return Config{}, errors.New("HTTP PIHOLE_API_URL requires PIHOLE_API_ALLOW_INSECURE_HTTP=true")
+		}
+	}
 	return Config{
 		ListenAddr:         env("APP_LISTEN_ADDR", ":8080"),
 		Password:           password,
 		DataPath:           env("DATA_PATH", "data/stormwarden.db"),
 		ExportDir:          env("EXPORT_DIR", "data/exports"),
 		PiHoleAddr:         piholeAddr,
+		PiHoleAPIURL:       piholeAPIURL,
+		PiHoleAPIPassword:  piholeAPIPassword,
 		PublicDNS:          env("PUBLIC_DNS_ADDR", "1.1.1.1:53"),
 		DoHURL:             env("DOH_PROBE_URL", "https://1.1.1.1/dns-query"),
 		AssetTargets:       assetTargets,

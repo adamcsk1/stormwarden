@@ -101,11 +101,13 @@ func probeTCP(ctx context.Context, name, address string) Sample {
 func probeDNS(ctx context.Context, target, address string) Sample {
 	started := time.Now()
 	s := Sample{CreatedAt: started, ProbeType: "dns", Target: target, Severity: Info}
-	id, query, err := newDNSQuery()
+	id, queryName, query, err := newDNSQuery()
 	if err != nil {
 		s.Severity, s.Message = Error, err.Error()
 		return s
 	}
+	s.dnsQueryName = queryName
+	s.dnsQueryAt = started
 	response, err := exchangeDNS(ctx, "udp", address, query)
 	if err != nil {
 		s.DurationMS = ms(time.Since(started))
@@ -128,11 +130,13 @@ func probeDNS(ctx context.Context, target, address string) Sample {
 func probeDNSTCP(ctx context.Context, target, address string) Sample {
 	started := time.Now()
 	s := Sample{CreatedAt: started, ProbeType: "dns", Target: target, Severity: Info}
-	id, query, err := newDNSQuery()
+	id, queryName, query, err := newDNSQuery()
 	if err != nil {
 		s.Severity, s.Message = Error, err.Error()
 		return s
 	}
+	s.dnsQueryName = queryName
+	s.dnsQueryAt = started
 	response, err := exchangeDNS(ctx, "tcp", address, query)
 	s.DurationMS, s.DNSMS = ms(time.Since(started)), ms(time.Since(started))
 	if err != nil {
@@ -154,7 +158,7 @@ func probeDNSTCP(ctx context.Context, target, address string) Sample {
 func probeDoH(ctx context.Context, target, endpoint string) Sample {
 	started := time.Now()
 	s := Sample{CreatedAt: started, ProbeType: "doh", Target: target, Severity: Info}
-	id, query, err := newDNSQuery()
+	id, _, query, err := newDNSQuery()
 	if err != nil {
 		s.Severity, s.Message = Error, err.Error()
 		return s
@@ -306,14 +310,14 @@ func validateDNSResponse(response, query []byte, id uint16) error {
 	return errors.New("DNS negative response lacks SOA authority")
 }
 
-func newDNSQuery() (uint16, []byte, error) {
+func newDNSQuery() (uint16, string, []byte, error) {
 	random := make([]byte, 10)
 	if _, err := rand.Read(random); err != nil {
-		return 0, nil, err
+		return 0, "", nil, err
 	}
 	id := binary.BigEndian.Uint16(random[:2])
 	domain := hex.EncodeToString(random[2:]) + ".example.com"
-	return id, dnsQuery(id, domain), nil
+	return id, domain, dnsQuery(id, domain), nil
 }
 
 func dnsSuccessMessage(response []byte, transport string) string {

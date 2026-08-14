@@ -34,6 +34,7 @@ type App struct {
 	incidentStates     map[string]*incidentState
 	exportJobs         chan exportJob
 	loginLimiter       *loginLimiter
+	piholeAPI          *piHoleAPIClient
 }
 
 type probeFunc struct {
@@ -136,9 +137,13 @@ func New(cfg Config, logger *slog.Logger) (*App, error) {
 	if lastCacheBustProbe.IsZero() {
 		lastCacheBustProbe = time.Now().Add(-cacheBustInterval)
 	}
-	return &App{
+	a := &App{
 		cfg: cfg, db: db, logger: logger, startedAt: time.Now(), sessions: newSessionStore(), exportJobs: make(chan exportJob, 16), loginLimiter: newLoginLimiter(), lastTransfer: lastTransfer, lastAssetProbe: lastAssetProbe, nextCacheBustProbe: lastCacheBustProbe.Add(cacheBustInterval), lastPersist: lastPersist, incidentStates: make(map[string]*incidentState),
-	}, nil
+	}
+	if cfg.PiHoleAPIURL != "" {
+		a.piholeAPI = newPiHoleAPIClient(cfg.PiHoleAPIURL, cfg.PiHoleAPIPassword)
+	}
+	return a, nil
 }
 
 func initializeAssetSettings(ctx context.Context, db *sql.DB, configuredDefault string) (string, error) {
@@ -380,6 +385,7 @@ func (a *App) runProbeCycle(ctx context.Context) {
 		}
 	}
 	aggregate, issues, observed := a.diagnoseSamples(samples)
+	a.correlatePiHoleIncident(ctx, issues)
 	if err := insertSample(ctx, a.db, aggregate); err != nil {
 		a.logger.Error("aggregate persistence failed", "error", err)
 		a.healthMu.Lock()
@@ -391,6 +397,27 @@ func (a *App) runProbeCycle(ctx context.Context) {
 		a.healthMu.Unlock()
 	}
 	a.updateIncidents(ctx, issues, observed)
+}
+
+func (a *App) correlatePiHoleIncident(ctx context.Context, issues []Sample) {
+	if a.piholeAPI == nil {
+		return
+	}
+	for index := range issues {
+		if issues[index].Target != "local_dns" && issues[index].Target != "pihole_udp_path" && issues[index].Target != "pihole_tcp_path" {
+			continue
+		}
+		probeTime := issues[index].dnsQueryAt
+		if probeTime.IsZero() {
+			probeTime = issues[index].CreatedAt
+		}
+		contextText, err := a.piholeAPI.correlate(ctx, probeTime, issues[index].dnsQueryName)
+		if err != nil {
+			a.logger.Warn("Pi-hole API correlation failed", "error", err)
+		}
+		issues[index].incidentContext = contextText
+		return
+	}
 }
 
 func (a *App) aggregateSample(samples []Sample) Sample {
@@ -552,6 +579,9 @@ func (a *App) updateIncidents(ctx context.Context, issues []Sample, observed map
 		state.badCycles++
 		if !isActive {
 			if state.badCycles == 1 || severityRank(issue.Severity) > severityRank(state.peakIssue.Severity) {
+				if issue.incidentContext == "" {
+					issue.incidentContext = state.peakIssue.incidentContext
+				}
 				state.peakIssue = issue
 			}
 			if state.badCycles >= 2 {

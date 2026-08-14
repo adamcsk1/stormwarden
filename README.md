@@ -11,6 +11,7 @@ Dockerized Go service for recording intermittent DNS and internet performance pr
 - Optional bounded transfer-speed test
 - Configurable fixed asset loads every 30 seconds and cache-busted loads every 5 minutes, capped at 512 KiB each
 - Correlated warning, error, and critical incidents
+- Optional Pi-hole v6 query and FTL diagnostic correlation for Pi-hole-specific incidents
 
 Probe traffic profiles are selectable in UI:
 
@@ -46,6 +47,9 @@ For HTTPS behind reverse proxy, set `APP_COOKIE_SECURE=true`. Do not expose plai
 | --- | --- | --- |
 | `APP_PASSWORD` | required | UI password |
 | `PIHOLE_DNS_ADDR` | `127.0.0.1:53` | Pi-hole UDP endpoint with TCP fallback for truncated replies |
+| `PIHOLE_API_URL` | disabled | Pi-hole v6 API base URL, such as `https://192.168.1.2/api` |
+| `PIHOLE_API_PASSWORD` | disabled | Pi-hole v6 application password; must be set with `PIHOLE_API_URL` |
+| `PIHOLE_API_ALLOW_INSECURE_HTTP` | `false` | Explicitly allow API credentials over HTTP on a trusted private network |
 | `PUBLIC_DNS_ADDR` | `1.1.1.1:53` | Control DNS endpoint |
 | `DOH_PROBE_URL` | Cloudflare DoH | DNS-over-HTTPS control endpoint |
 | `HTTP_PROBE_URL` | Google 204 endpoint | Small HTTP timing target |
@@ -76,6 +80,8 @@ Generated reports run through one background worker and expire after 7 days. Raw
 Report targets remove URL credentials, query strings, and fragments before persistence. Rollups preserve resolver target plus DNS, connection, TLS, TTFB, and transfer measurements.
 
 Pi-hole should continue listening on its standard LAN port `53`. A local dnsproxy listener such as `127.0.0.1:5053` is an internal Pi-hole upstream and must not be configured as Stormwarden's Pi-hole address.
+
+For optional Pi-hole v6 incident correlation, create a dedicated application password in Pi-hole and set both `PIHOLE_API_URL` and `PIHOLE_API_PASSWORD`. Use HTTPS when possible. HTTP requires `PIHOLE_API_ALLOW_INSECURE_HTTP=true` and should only be used on a trusted private network because it exposes the application password and session ID in transit. Stormwarden does not poll the authenticated API continuously. The first Pi-hole-specific bad cycle opens one temporary API session, fetches the exact randomized probe query and recent FTL diagnosis types, logs out immediately, and then waits at least five minutes before another attempt. If logout cannot be confirmed, another login is blocked for 30 minutes, matching Pi-hole's default session lifetime. Generic TCP and HTTP incidents never contact the Pi-hole API. API failures remain supplemental evidence and do not affect availability or incident severity. FTL message text, client identifiers, unrelated query history, application passwords, and session IDs are never persisted or included in reports.
 
 ## Development
 
