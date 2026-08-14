@@ -1,4 +1,4 @@
-module github.com/adamf/internet-analyzer
+module github.com/adamcsk1/stormwarden
 
 go 1.26
 

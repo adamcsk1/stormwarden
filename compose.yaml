@@ -1,5 +1,7 @@
+name: stormwarden
+
 services:
-  internet-analyzer:
+  stormwarden:
     build: .
     network_mode: host
     restart: unless-stopped
@@ -11,7 +13,7 @@ services:
       APP_LISTEN_ADDR: ${APP_LISTEN_ADDR:-:8080}
       HTTP_EXPECTED_STATUS: ${HTTP_EXPECTED_STATUS:-204}
     volumes:
-      - analyzer-data:/data
+      - stormwarden-data:/data
     read_only: true
     tmpfs:
       - /tmp:size=16m
@@ -19,4 +21,4 @@ services:
       - no-new-privileges:true
 
 volumes:
-  analyzer-data:
+  stormwarden-data:

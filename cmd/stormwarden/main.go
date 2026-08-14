@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/adamf/internet-analyzer/internal/app"
+	"github.com/adamcsk1/stormwarden/internal/app"
 )
 
 func main() {

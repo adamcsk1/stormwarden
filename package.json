@@ -1,4 +1,5 @@
 {
+  "name": "stormwarden",
   "private": true,
   "scripts": {
     "vendor": "node -e \"require('fs').copyFileSync('node_modules/htmx.org/dist/htmx.min.js','internal/app/web/static/htmx.min.js')\""

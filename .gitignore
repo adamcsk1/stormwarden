@@ -1,7 +1,7 @@
 /data/
 /node_modules/
 /.env
-/internet-analyzer
+/stormwarden
 *.db
 *.db-shm
 *.db-wal
