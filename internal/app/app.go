@@ -15,24 +15,25 @@ import (
 )
 
 type App struct {
-	cfg            Config
-	db             *sql.DB
-	logger         *slog.Logger
-	startedAt      time.Time
-	sessions       *sessionStore
-	probeMu        sync.Mutex
-	assetMu        sync.Mutex
-	incidentMu     sync.Mutex
-	dataMu         sync.RWMutex
-	healthMu       sync.RWMutex
-	lastPersist    time.Time
-	lastPersistErr error
-	lastTransfer   time.Time
-	lastAssetProbe time.Time
-	criticalCycles int
-	incidentStates map[string]*incidentState
-	exportJobs     chan exportJob
-	loginLimiter   *loginLimiter
+	cfg                Config
+	db                 *sql.DB
+	logger             *slog.Logger
+	startedAt          time.Time
+	sessions           *sessionStore
+	probeMu            sync.Mutex
+	assetMu            sync.Mutex
+	incidentMu         sync.Mutex
+	dataMu             sync.RWMutex
+	healthMu           sync.RWMutex
+	lastPersist        time.Time
+	lastPersistErr     error
+	lastTransfer       time.Time
+	lastAssetProbe     time.Time
+	nextCacheBustProbe time.Time
+	criticalCycles     int
+	incidentStates     map[string]*incidentState
+	exportJobs         chan exportJob
+	loginLimiter       *loginLimiter
 }
 
 type probeFunc struct {
@@ -113,23 +114,58 @@ func New(cfg Config, logger *slog.Logger) (*App, error) {
 		lastTransfer = time.Now()
 	}
 	lastPersist, _ := latestSampleTime(context.Background(), db, "aggregate")
+	assetTargets, err := initializeAssetSettings(context.Background(), db, cfg.AssetTargets)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
 	lastAssetProbe, _ := latestSampleTime(context.Background(), db, "asset")
 	if lastAssetProbe.IsZero() {
-		lastAssetProbe = time.Now().Add(-30 * time.Second)
+		lastAssetProbe = time.Now().Add(-fixedAssetInterval)
 	}
-	if _, err := setting(context.Background(), db, "asset_targets"); err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			db.Close()
-			return nil, err
+	lastCacheBustProbe := time.Time{}
+	parsedTargets, _ := parseAssetTargets(assetTargets)
+	for _, target := range parsedTargets {
+		if !target.CacheBust {
+			continue
 		}
-		if err = setSetting(context.Background(), db, "asset_targets", cfg.AssetTargets); err != nil {
-			db.Close()
-			return nil, err
+		if sample, sampleErr := latestSampleByTarget(context.Background(), db, assetSampleTarget(target)); sampleErr == nil && sample != nil && sample.CreatedAt.After(lastCacheBustProbe) {
+			lastCacheBustProbe = sample.CreatedAt
 		}
+	}
+	if lastCacheBustProbe.IsZero() {
+		lastCacheBustProbe = time.Now().Add(-cacheBustInterval)
 	}
 	return &App{
-		cfg: cfg, db: db, logger: logger, startedAt: time.Now(), sessions: newSessionStore(), exportJobs: make(chan exportJob, 16), loginLimiter: newLoginLimiter(), lastTransfer: lastTransfer, lastAssetProbe: lastAssetProbe, lastPersist: lastPersist, incidentStates: make(map[string]*incidentState),
+		cfg: cfg, db: db, logger: logger, startedAt: time.Now(), sessions: newSessionStore(), exportJobs: make(chan exportJob, 16), loginLimiter: newLoginLimiter(), lastTransfer: lastTransfer, lastAssetProbe: lastAssetProbe, nextCacheBustProbe: lastCacheBustProbe.Add(cacheBustInterval), lastPersist: lastPersist, incidentStates: make(map[string]*incidentState),
 	}, nil
+}
+
+func initializeAssetSettings(ctx context.Context, db *sql.DB, configuredDefault string) (string, error) {
+	value, err := setting(ctx, db, "asset_targets")
+	existed := err == nil
+	if errors.Is(err, sql.ErrNoRows) {
+		value = configuredDefault
+		if err := setSetting(ctx, db, "asset_targets", value); err != nil {
+			return "", err
+		}
+	} else if err != nil {
+		return "", err
+	}
+	if _, err := setting(ctx, db, "asset_defaults_v2"); errors.Is(err, sql.ErrNoRows) {
+		if existed && value == legacyDefaultAssetTargets {
+			value = defaultAssetTargets
+			if err := setSetting(ctx, db, "asset_targets", value); err != nil {
+				return "", err
+			}
+		}
+		if err := setSetting(ctx, db, "asset_defaults_v2", "1"); err != nil {
+			return "", err
+		}
+	} else if err != nil {
+		return "", err
+	}
+	return value, nil
 }
 
 func (a *App) Close() error { return a.db.Close() }
@@ -142,7 +178,7 @@ func (a *App) Start(ctx context.Context) {
 }
 
 func (a *App) assetScheduler(ctx context.Context) {
-	wait := time.Until(a.lastAssetProbe.Add(30 * time.Second))
+	wait := time.Until(a.lastAssetProbe.Add(fixedAssetInterval))
 	if wait < 0 {
 		wait = 0
 	}
@@ -153,20 +189,25 @@ func (a *App) assetScheduler(ctx context.Context) {
 		return
 	case <-timer.C:
 	}
-	ticker := time.NewTicker(30 * time.Second)
+	firstCycleAt := time.Now()
+	ticker := time.NewTicker(fixedAssetInterval)
 	defer ticker.Stop()
-	a.runAssetProbeCycle(ctx)
+	a.runAssetProbeCycleAt(ctx, firstCycleAt)
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			a.runAssetProbeCycle(ctx)
+		case cycleAt := <-ticker.C:
+			a.runAssetProbeCycleAt(ctx, cycleAt)
 		}
 	}
 }
 
 func (a *App) runAssetProbeCycle(ctx context.Context) {
+	a.runAssetProbeCycleAt(ctx, time.Now())
+}
+
+func (a *App) runAssetProbeCycleAt(ctx context.Context, cycleAt time.Time) {
 	a.assetMu.Lock()
 	defer a.assetMu.Unlock()
 	configured, err := setting(ctx, a.db, "asset_targets")
@@ -179,10 +220,24 @@ func (a *App) runAssetProbeCycle(ctx context.Context) {
 		a.logger.Error("asset probe configuration invalid", "error", err)
 		return
 	}
+	cacheBustDue := !cycleAt.Before(a.nextCacheBustProbe)
 	probes := make([]probeFunc, 0, len(targets))
+	categories := make(map[string]string, len(targets))
+	cacheBustIncluded := false
 	for _, target := range targets {
+		if target.CacheBust && !cacheBustDue {
+			continue
+		}
 		target := target
+		cacheBustIncluded = cacheBustIncluded || target.CacheBust
+		categories[target.Name] = assetIncidentCategory(target)
 		probes = append(probes, probeFunc{ProbeType: "asset", Target: assetSampleTarget(target), Run: func(probeCtx context.Context) Sample { return probeAsset(probeCtx, target, a.cfg.HTTPDNSAddr) }})
+	}
+	if cacheBustIncluded {
+		a.nextCacheBustProbe = a.nextCacheBustProbe.Add(cacheBustInterval)
+		if !a.nextCacheBustProbe.After(cycleAt) {
+			a.nextCacheBustProbe = cycleAt.Add(cacheBustInterval)
+		}
 	}
 	samples := runConcurrentProbes(ctx, assetProbeTimeout(), probes)
 	if ctx.Err() != nil {
@@ -195,7 +250,7 @@ func (a *App) runAssetProbeCycle(ctx context.Context) {
 			a.logger.Error("asset sample persistence failed", "error", err)
 		}
 		name := assetSampleName(sample.Target)
-		category := assetIncidentCategory(name)
+		category := categories[name]
 		observed[category] = true
 		if sample.Severity != Info {
 			issue := incidentSample(sample, category)
@@ -482,7 +537,11 @@ func (a *App) updateIncidents(ctx context.Context, issues []Sample, observed map
 			state.badCycles = 0
 			state.peakIssue = Sample{}
 			state.healthyCycles++
-			if isActive && state.healthyCycles >= 3 {
+			healthyCyclesRequired := 3
+			if strings.HasPrefix(category, "asset_cache_bust:") {
+				healthyCyclesRequired = 1
+			}
+			if isActive && state.healthyCycles >= healthyCyclesRequired {
 				if err := closeIncident(ctx, a.db, incident.ID); err != nil {
 					a.logger.Error("incident close failed", "category", category, "error", err)
 				}

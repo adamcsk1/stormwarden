@@ -9,7 +9,7 @@ Dockerized Go service for recording intermittent DNS and internet performance pr
 - Independent TCP internet connectivity
 - HTTP DNS, connect, TLS, time-to-first-byte, total duration, and status
 - Optional bounded transfer-speed test
-- Configurable representative-image loads every 30 seconds, capped at 512 KiB each
+- Configurable fixed asset loads every 30 seconds and cache-busted loads every 5 minutes, capped at 512 KiB each
 - Correlated warning, error, and critical incidents
 
 Probe traffic profiles are selectable in UI:
@@ -20,7 +20,7 @@ Probe traffic profiles are selectable in UI:
 | Low | 256 KiB every 15 minutes | About 0.75 GB/month |
 | Detailed | 5 MiB every 15 minutes | About 15 GB/month |
 
-Asset traffic is separate from the selected profile. Configure up to eight stable public image URLs in Probe settings using one `Name|URL` entry per line. Each target runs every 30 seconds and stops after 512 KiB, so choose small representative images; 100 KiB per response is about 8.6 GB/month per target, while the 512 KiB cap is about 45 GB/month per target.
+Asset traffic is separate from the selected profile. Configure up to eight targets in Probe settings. `Name|URL` runs every 30 seconds. `Name|cache-bust|URL` adds a random query and runs every 5 minutes. Downloads stop after 512 KiB. The defaults use a fixed 21 KiB YouTube thumbnail and a cache-busted 32 KiB Cloudflare test response, totaling about 2.1 GB/month.
 
 ## Run
 
@@ -52,7 +52,7 @@ For HTTPS behind reverse proxy, set `APP_COOKIE_SECURE=true`. Do not expose plai
 | `HTTP_DNS_ADDR` | `PIHOLE_DNS_ADDR` | Explicit resolver used by HTTP probes |
 | `HTTP_EXPECTED_STATUS` | `204` | Required probe response; use `0` for any 2xx/3xx |
 | `TRANSFER_PROBE_URL` | Cloudflare speed endpoint | Bounded transfer target |
-| `ASSET_PROBES` | YouTube thumbnail | Initial asset targets, as `Name|URL` entries separated by semicolons |
+| `ASSET_PROBES` | YouTube + Cloudflare test | Initial asset targets separated by semicolons; use `Name|cache-bust|URL` for five-minute randomized queries |
 | `APP_TIMEZONE` | `Europe/Budapest` | Display timezone |
 | `APP_COOKIE_SECURE` | `false` | Require HTTPS session cookies |
 | `APP_PORT` | `8080` | Host port published by Docker Compose |
