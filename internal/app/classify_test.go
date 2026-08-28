@@ -135,6 +135,20 @@ func TestClassifyTLSOnly(t *testing.T) {
 	assertDiagnosis(t, d, "tls_or_remote_service", "high", Warning)
 }
 
+func TestClassifyNICAloneDoesNotStealWAN(t *testing.T) {
+	samples := append(healthyDNS(),
+		tcpSample("cloudflare", Warning, 2086, true),
+		tcpSample("google", Warning, 2101, true),
+		burst("gateway", 0), burst("pihole", 0), burst("internet", 30),
+		Sample{ProbeType: "nic", Target: "eth0", Bytes: 1, Message: "RX errors increased by 1 during this incident."},
+	)
+	d := classify(Snapshot{Samples: samples})
+	assertDiagnosis(t, d, "wan_or_isp_packet_loss", "high", Error)
+	if !containsAll(d.Evidence, "RX errors increased by 1 during this incident.") {
+		t.Fatalf("NIC evidence dropped: %+v", d.Evidence)
+	}
+}
+
 func TestClassifyHostNIC(t *testing.T) {
 	samples := append(healthyDNS(),
 		tcpSample("cloudflare", Error, 4000, false),

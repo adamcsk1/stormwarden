@@ -55,6 +55,13 @@ func TestBurstLimiterContextCancelDoesNotMatter(t *testing.T) {
 	}
 }
 
+func TestParsePingIncompleteWindowsLine(t *testing.T) {
+	sent, recv, loss, minMS, avgMS, maxMS, _ := parsePing("Minimum = 1ms", 10)
+	if sent != 10 || recv != 0 || loss != 100 || minMS != 1 || avgMS != 0 || maxMS != 0 {
+		t.Fatalf("incomplete line panicked or misparsed sent=%d recv=%d loss=%v min=%v avg=%v max=%v", sent, recv, loss, minMS, avgMS, maxMS)
+	}
+}
+
 func TestParsePingLinux(t *testing.T) {
 	text := `PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.
 10 packets transmitted, 7 received, 30% packet loss, time 1351ms
@@ -81,6 +88,22 @@ func TestParseTraceAndISPHop(t *testing.T) {
 func TestDockerLikeGateway(t *testing.T) {
 	if !dockerLike("172.23.0.1") || dockerLike("192.168.88.1") {
 		t.Fatal("docker gateway detection")
+	}
+}
+
+func TestRefreshNetInfoNoteWhenGatewayConfigured(t *testing.T) {
+	a := newTestApp(t)
+	a.cfg.GatewayAddr = "192.168.88.1"
+	a.refreshNetInfo()
+	a.netMu.RLock()
+	note := a.netInfo.Note
+	src := a.netInfo.LANGatewaySource
+	a.netMu.RUnlock()
+	if src != "config" {
+		t.Fatalf("source=%s", src)
+	}
+	if strings.Contains(note, "Set GATEWAY_ADDR") {
+		t.Fatalf("still nags for GATEWAY_ADDR: %s", note)
 	}
 }
 

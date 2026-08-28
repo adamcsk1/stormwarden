@@ -37,15 +37,19 @@ func (b *Baseline) note(e extracted) string {
 
 func (a *App) currentBaseline(ctx context.Context) *Baseline {
 	a.baseMu.Lock()
-	defer a.baseMu.Unlock()
-	if a.baseline != nil && time.Since(a.baseline.ComputedAt) < 15*time.Minute {
-		return a.baseline
+	cached := a.baseline
+	if cached != nil && time.Since(cached.ComputedAt) < 15*time.Minute {
+		a.baseMu.Unlock()
+		return cached
 	}
+	a.baseMu.Unlock()
 	b, err := loadBaseline(ctx, a.db)
 	if err != nil {
-		return a.baseline
+		return cached
 	}
+	a.baseMu.Lock()
 	a.baseline = b
+	a.baseMu.Unlock()
 	return b
 }
 
