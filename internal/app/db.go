@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -131,6 +132,19 @@ CREATE TABLE IF NOT EXISTS daily_rollups_v2 (
 		return err
 	}
 	if err := ensureColumn(db, "exports", "error", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "incidents", "confidence", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "incidents", "contradictions", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS annotations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL,
+  note TEXT NOT NULL
+)`); err != nil {
 		return err
 	}
 	if value, _ := setting(context.Background(), db, "fixed_timestamps_v1"); value != "done" {
@@ -351,8 +365,10 @@ func setSetting(ctx context.Context, db *sql.DB, key, value string) error {
 	return err
 }
 
+const incidentColumns = `id, started_at, ended_at, severity, category, summary, evidence, confidence, contradictions`
+
 func activeIncident(ctx context.Context, db *sql.DB) (*Incident, error) {
-	row := db.QueryRowContext(ctx, `SELECT id, started_at, ended_at, severity, category, summary, evidence FROM incidents WHERE ended_at IS NULL ORDER BY CASE severity WHEN 'critical' THEN 3 WHEN 'error' THEN 2 WHEN 'warning' THEN 1 ELSE 0 END DESC, id DESC LIMIT 1`)
+	row := db.QueryRowContext(ctx, `SELECT `+incidentColumns+` FROM incidents WHERE ended_at IS NULL ORDER BY CASE severity WHEN 'critical' THEN 3 WHEN 'error' THEN 2 WHEN 'warning' THEN 1 ELSE 0 END DESC, id DESC LIMIT 1`)
 	incident, err := scanIncident(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -361,7 +377,7 @@ func activeIncident(ctx context.Context, db *sql.DB) (*Incident, error) {
 }
 
 func activeIncidents(ctx context.Context, db *sql.DB) ([]Incident, error) {
-	rows, err := db.QueryContext(ctx, `SELECT id, started_at, ended_at, severity, category, summary, evidence FROM incidents WHERE ended_at IS NULL ORDER BY id`)
+	rows, err := db.QueryContext(ctx, `SELECT `+incidentColumns+` FROM incidents WHERE ended_at IS NULL ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -381,7 +397,7 @@ func scanIncident(row interface{ Scan(...any) error }) (Incident, error) {
 	var i Incident
 	var started string
 	var ended sql.NullString
-	err := row.Scan(&i.ID, &started, &ended, &i.Severity, &i.Category, &i.Summary, &i.Evidence)
+	err := row.Scan(&i.ID, &started, &ended, &i.Severity, &i.Category, &i.Summary, &i.Evidence, &i.Confidence, &i.Contradictions)
 	if err != nil {
 		return i, err
 	}
@@ -397,7 +413,7 @@ func scanIncident(row interface{ Scan(...any) error }) (Incident, error) {
 }
 
 func recentIncidents(ctx context.Context, db *sql.DB, since time.Time, limit int) ([]Incident, error) {
-	rows, err := db.QueryContext(ctx, `SELECT id, started_at, ended_at, severity, category, summary, evidence FROM incidents WHERE started_at >= ? ORDER BY started_at DESC LIMIT ?`, dbTime(since), limit)
+	rows, err := db.QueryContext(ctx, `SELECT `+incidentColumns+` FROM incidents WHERE started_at >= ? ORDER BY started_at DESC LIMIT ?`, dbTime(since), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -414,7 +430,7 @@ func recentIncidents(ctx context.Context, db *sql.DB, since time.Time, limit int
 }
 
 func incidentPage(ctx context.Context, db *sql.DB, limit, offset int) ([]Incident, bool, error) {
-	rows, err := db.QueryContext(ctx, `SELECT id, started_at, ended_at, severity, category, summary, evidence FROM incidents ORDER BY started_at DESC LIMIT ? OFFSET ?`, limit+1, offset)
+	rows, err := db.QueryContext(ctx, `SELECT `+incidentColumns+` FROM incidents ORDER BY started_at DESC LIMIT ? OFFSET ?`, limit+1, offset)
 	if err != nil {
 		return nil, false, err
 	}
@@ -439,11 +455,20 @@ func openIncident(ctx context.Context, db *sql.DB, s Sample) error {
 }
 
 func openIncidentWithPeak(ctx context.Context, db *sql.DB, current, peak Sample) error {
-	evidence := incidentEvidence(peak)
+	doc := evidenceFromSample(peak)
 	if current.Severity != peak.Severity || current.Message != peak.Message || current.DurationMS != peak.DurationMS {
-		evidence += "\n" + incidentEvidence(current)
+		doc.Events = append(doc.Events, incidentEvidence(current))
 	}
-	_, err := db.ExecContext(ctx, `INSERT INTO incidents(started_at, severity, category, summary, evidence) VALUES (?, ?, ?, ?, ?)`, dbTime(time.Now()), peak.Severity, categoryFor(current), current.Message, evidence)
+	if current.diagnosis != nil {
+		doc = mergeDiagnosis(doc, current.diagnosis)
+	}
+	evidence, _ := json.Marshal(doc)
+	confidence, contradictions := "", ""
+	if current.diagnosis != nil {
+		confidence = current.diagnosis.Confidence
+		contradictions = strings.Join(current.diagnosis.Contradictions, "\n")
+	}
+	_, err := db.ExecContext(ctx, `INSERT INTO incidents(started_at, severity, category, summary, evidence, confidence, contradictions) VALUES (?, ?, ?, ?, ?, ?, ?)`, dbTime(time.Now()), peak.Severity, categoryFor(current), current.Message, string(evidence), confidence, contradictions)
 	return err
 }
 
@@ -457,8 +482,13 @@ func updateIncident(ctx context.Context, db *sql.DB, id int64, s Sample, peakSev
 	if err := db.QueryRowContext(ctx, `SELECT evidence FROM incidents WHERE id=? AND ended_at IS NULL`, id).Scan(&existing); err != nil {
 		return err
 	}
-	evidence := mergeIncidentEvidence(existing, incidentEvidence(s), promotePeak)
-	_, err := db.ExecContext(ctx, `UPDATE incidents SET severity=?, category=?, summary=?, evidence=? WHERE id=? AND ended_at IS NULL`, peakSeverity, s.Target, s.Message, evidence, id)
+	evidence := mergeIncidentEvidenceJSON(existing, s, promotePeak)
+	confidence, contradictions := "", ""
+	if s.diagnosis != nil {
+		confidence = s.diagnosis.Confidence
+		contradictions = strings.Join(s.diagnosis.Contradictions, "\n")
+	}
+	_, err := db.ExecContext(ctx, `UPDATE incidents SET severity=?, category=?, summary=?, evidence=?, confidence=?, contradictions=? WHERE id=? AND ended_at IS NULL`, peakSeverity, s.Target, s.Message, evidence, confidence, contradictions, id)
 	return err
 }
 
@@ -479,6 +509,58 @@ func mergeIncidentEvidence(existing, current string, promotePeak bool) string {
 	return peak + "\n... older events truncated ...\n" + string(historyRunes)
 }
 
+func evidenceFromSample(s Sample) incidentEvidenceDoc {
+	doc := incidentEvidenceDoc{Events: []string{incidentEvidence(s)}}
+	return mergeDiagnosis(doc, s.diagnosis)
+}
+
+func mergeDiagnosis(doc incidentEvidenceDoc, d *Diagnosis) incidentEvidenceDoc {
+	if d == nil {
+		return doc
+	}
+	doc.Classification, doc.Confidence, doc.Evidence, doc.Contradictions = d.Classification, d.Confidence, d.Evidence, d.Contradictions
+	return doc
+}
+
+func mergeIncidentEvidenceJSON(existing string, s Sample, promotePeak bool) string {
+	doc := parseEvidenceDoc(existing)
+	line := incidentEvidence(s)
+	if promotePeak {
+		doc.Events = append([]string{line}, doc.Events...)
+	} else {
+		doc.Events = append(doc.Events, line)
+	}
+	doc = mergeDiagnosis(doc, s.diagnosis)
+	encoded, err := json.Marshal(truncateEvidenceDoc(doc))
+	if err != nil {
+		return mergeIncidentEvidence(existing, line, promotePeak)
+	}
+	return string(encoded)
+}
+
+func parseEvidenceDoc(raw string) incidentEvidenceDoc {
+	var doc incidentEvidenceDoc
+	if json.Unmarshal([]byte(raw), &doc) == nil && (len(doc.Events) > 0 || len(doc.Evidence) > 0 || doc.Classification != "") {
+		return doc
+	}
+	if strings.TrimSpace(raw) == "" {
+		return incidentEvidenceDoc{}
+	}
+	return incidentEvidenceDoc{Events: []string{raw}}
+}
+
+func truncateEvidenceDoc(doc incidentEvidenceDoc) incidentEvidenceDoc {
+	encoded, _ := json.Marshal(doc)
+	if len(encoded) <= 12000 {
+		return doc
+	}
+	if len(doc.Events) > 8 {
+		peak := doc.Events[0]
+		doc.Events = append([]string{peak, "... older events truncated ..."}, doc.Events[len(doc.Events)-4:]...)
+	}
+	return doc
+}
+
 func incidentEvidence(s Sample) string {
 	at := s.CreatedAt
 	if at.IsZero() {
@@ -489,6 +571,69 @@ func incidentEvidence(s Sample) string {
 		evidence += "\n" + s.incidentContext
 	}
 	return evidence
+}
+
+func samplesBetween(ctx context.Context, db *sql.DB, from, to time.Time, limit int) ([]Sample, error) {
+	rows, err := db.QueryContext(ctx, `SELECT `+sampleColumns+` FROM samples WHERE created_at>=? AND created_at<? ORDER BY created_at LIMIT ?`, dbTime(from), dbTime(to), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []Sample
+	for rows.Next() {
+		s, err := scanSample(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, s)
+	}
+	return result, rows.Err()
+}
+
+func incidentByID(ctx context.Context, db *sql.DB, id int64) (*Incident, error) {
+	incident, err := scanIncident(db.QueryRowContext(ctx, `SELECT `+incidentColumns+` FROM incidents WHERE id=?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &incident, nil
+}
+
+func insertAnnotation(ctx context.Context, db *sql.DB, note string) error {
+	note = strings.TrimSpace(note)
+	if note == "" {
+		return errors.New("annotation note is required")
+	}
+	if len([]rune(note)) > 500 {
+		return errors.New("annotation note is too long")
+	}
+	_, err := db.ExecContext(ctx, `INSERT INTO annotations(created_at, note) VALUES (?, ?)`, dbTime(time.Now()), note)
+	return err
+}
+
+func listAnnotations(ctx context.Context, db *sql.DB, from, to time.Time, limit int) ([]Annotation, error) {
+	rows, err := db.QueryContext(ctx, `SELECT id, created_at, note FROM annotations WHERE created_at>=? AND created_at<? ORDER BY created_at DESC LIMIT ?`, dbTime(from), dbTime(to), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []Annotation
+	for rows.Next() {
+		var item Annotation
+		var created string
+		if err := rows.Scan(&item.ID, &created, &item.Note); err != nil {
+			return nil, err
+		}
+		item.CreatedAt, _ = parseDBTime(created)
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+func recentAnnotations(ctx context.Context, db *sql.DB, limit int) ([]Annotation, error) {
+	return listAnnotations(ctx, db, time.Unix(0, 0), time.Now().Add(time.Minute), limit)
 }
 
 func cleanup(ctx context.Context, db *sql.DB, rawRetention time.Duration) error {

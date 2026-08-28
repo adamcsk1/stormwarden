@@ -6,3 +6,22 @@
   flex: 0 0 auto;
   align-self: flex-start;
 }
+
+.evidence, .contradictions {
+  margin: 8px 0;
+  padding-left: 18px;
+  color: var(--muted);
+}
+
+.contradictions {
+  color: var(--warn);
+}
+
+.timeline, .timeline-slot pre {
+  font: 12px ui-monospace, monospace;
+  white-space: pre;
+  overflow-x: auto;
+  background: #0b1714;
+  padding: 10px;
+  border-radius: 8px;
+}

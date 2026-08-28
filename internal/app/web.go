@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"embed"
 	"encoding/base64"
+	"fmt"
 	"html/template"
 	"io/fs"
 	"net"
@@ -151,6 +152,10 @@ func (a *App) routes() http.Handler {
 	mux.Handle("GET /ui/dns-paths", a.requireAuth(http.HandlerFunc(a.dnsPathsFragment)))
 	mux.Handle("GET /ui/assets", a.requireAuth(http.HandlerFunc(a.assetsFragment)))
 	mux.Handle("GET /ui/incidents", a.requireAuth(http.HandlerFunc(a.incidentsFragment)))
+	mux.Handle("GET /ui/incidents/{id}", a.requireAuth(http.HandlerFunc(a.incidentDetailFragment)))
+	mux.Handle("GET /ui/layers", a.requireAuth(http.HandlerFunc(a.layersFragment)))
+	mux.Handle("GET /ui/compare", a.requireAuth(http.HandlerFunc(a.compareFragment)))
+	mux.Handle("POST /ui/annotations", a.requireAuth(http.HandlerFunc(a.createAnnotation)))
 	mux.Handle("GET /ui/settings", a.requireAuth(http.HandlerFunc(a.settingsFragment)))
 	mux.Handle("POST /ui/settings", a.requireAuth(http.HandlerFunc(a.saveSettings)))
 	mux.Handle("POST /ui/pihole-api-health", a.requireAuth(http.HandlerFunc(a.checkPiHoleAPIHealth)))
@@ -383,14 +388,155 @@ func (a *App) incidentsFragment(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	a.render(w, "incidents.html", map[string]any{"Incidents": incidents, "DisplayPage": page + 1, "Previous": page > 0, "PreviousPage": max(page-1, 0), "Next": hasMore, "NextPage": page + 1})
+	views := make([]incidentView, 0, len(incidents))
+	for _, incident := range incidents {
+		views = append(views, a.toIncidentView(incident, false))
+	}
+	a.render(w, "incidents.html", map[string]any{"Incidents": views, "DisplayPage": page + 1, "Previous": page > 0, "PreviousPage": max(page-1, 0), "Next": hasMore, "NextPage": page + 1})
+}
+
+type incidentView struct {
+	Incident
+	EvidenceItems      []string
+	ContradictionItems []string
+	Events             string
+	Timeline           []string
+}
+
+func (a *App) toIncidentView(incident Incident, withTimeline bool) incidentView {
+	view := incidentView{Incident: incident}
+	doc := parseEvidenceDoc(incident.Evidence)
+	view.EvidenceItems, view.ContradictionItems = doc.Evidence, doc.Contradictions
+	if len(doc.Contradictions) == 0 && incident.Contradictions != "" {
+		view.ContradictionItems = strings.Split(incident.Contradictions, "\n")
+	}
+	view.Events = strings.Join(doc.Events, "\n")
+	if view.Events == "" && doc.Classification == "" {
+		view.Events = incident.Evidence
+	}
+	if withTimeline {
+		end := time.Now()
+		if incident.EndedAt != nil {
+			end = incident.EndedAt.Add(30 * time.Second)
+		}
+		samples, _ := samplesBetween(context.Background(), a.db, incident.StartedAt.Add(-30*time.Second), end, 80)
+		view.Timeline = formatTimeline(samples, a.cfg.Timezone)
+	}
+	return view
+}
+
+func formatTimeline(samples []Sample, loc *time.Location) []string {
+	if loc == nil {
+		loc = time.UTC
+	}
+	lines := make([]string, 0, len(samples))
+	for _, s := range samples {
+		state := strings.ToUpper(string(s.Severity))
+		if s.Success && s.Severity == Info {
+			state = "OK"
+		}
+		if s.ProbeType == "icmp-burst" && s.Mbps > 0 {
+			state = "LOSS"
+		}
+		detail := fmt.Sprintf("%.0f ms", s.DurationMS)
+		if s.ProbeType == "icmp-burst" && s.Mbps > 0 {
+			detail = fmt.Sprintf("%.0f%%", s.Mbps)
+		}
+		if retransmissionSuspected(s.ConnectMS) || retransmissionSuspected(s.DurationMS) {
+			detail += "  tcp_retransmission_suspected"
+		}
+		lines = append(lines, fmt.Sprintf("%s  %-22s %-8s %s", s.CreatedAt.In(loc).Format("15:04:05.000"), s.Target, state, detail))
+	}
+	return lines
+}
+
+func (a *App) incidentDetailFragment(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	incident, err := incidentByID(r.Context(), a.db, id)
+	if err != nil || incident == nil {
+		http.Error(w, "incident not found", http.StatusNotFound)
+		return
+	}
+	a.render(w, "incident-detail.html", a.toIncidentView(*incident, true))
+}
+
+func (a *App) layersFragment(w http.ResponseWriter, r *http.Request) {
+	type layer struct {
+		Label  string
+		Sample *Sample
+		Stale  bool
+	}
+	defs := []struct{ target, label string }{
+		{"icmp:pihole", "Pi-hole ping"},
+		{"icmp:gateway", "Gateway ping"},
+		{"icmp:isp_hop", "ISP hop ping"},
+		{"icmp:internet", "Internet ping"},
+	}
+	layers := make([]layer, 0, len(defs)+6)
+	for _, def := range defs {
+		sample, err := latestSampleByTarget(r.Context(), a.db, def.target)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		layers = append(layers, layer{Label: def.label, Sample: sample, Stale: sample != nil && time.Since(sample.CreatedAt) > 10*time.Minute})
+	}
+	for _, control := range a.cfg.tcpControls() {
+		sample, err := latestSampleByTarget(r.Context(), a.db, tcpSampleTarget(control.Name))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		layers = append(layers, layer{Label: "TCP " + control.Name, Sample: sample, Stale: sample != nil && time.Since(sample.CreatedAt) > 45*time.Second})
+	}
+	a.netMu.RLock()
+	info := a.netInfo
+	a.netMu.RUnlock()
+	a.render(w, "layers.html", map[string]any{"Layers": layers, "Net": info})
+}
+
+func (a *App) compareFragment(w http.ResponseWriter, r *http.Request) {
+	now := time.Now()
+	rangeName := r.URL.Query().Get("range")
+	var aFrom, aTo, bFrom, bTo time.Time
+	labelA, labelB := "last 24h", "previous 24h"
+	switch rangeName {
+	case "week":
+		aFrom, aTo = now.Add(-7*24*time.Hour), now
+		bFrom, bTo = now.Add(-14*24*time.Hour), now.Add(-7*24*time.Hour)
+		labelA, labelB = "this week", "previous week"
+	default:
+		aFrom, aTo = now.Add(-24*time.Hour), now
+		bFrom, bTo = now.Add(-48*time.Hour), now.Add(-24*time.Hour)
+	}
+	left, right := periodStats(r.Context(), a.db, aFrom, aTo), periodStats(r.Context(), a.db, bFrom, bTo)
+	left.Label, right.Label = labelA, labelB
+	a.render(w, "compare.html", map[string]any{"A": left, "B": right, "Range": rangeName})
+}
+
+func (a *App) createAnnotation(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	if err := r.ParseForm(); err != nil || !a.validCSRF(r) {
+		http.Error(w, "invalid request", http.StatusForbidden)
+		return
+	}
+	if err := insertAnnotation(r.Context(), a.db, r.FormValue("note")); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	r.URL.RawQuery = "saved=1"
+	a.settingsFragment(w, r)
 }
 
 func (a *App) settingsFragment(w http.ResponseWriter, r *http.Request) {
 	profile, _ := setting(r.Context(), a.db, "profile")
 	assetTargets, _ := setting(r.Context(), a.db, "asset_targets")
 	s := r.Context().Value(sessionContextKey).(session)
-	a.render(w, "settings.html", map[string]any{"Profile": profile, "AssetTargets": assetTargets, "CSRF": s.CSRF, "Saved": r.URL.Query().Get("saved") != "", "PiHoleHealth": a.piHoleHealthView(s.CSRF)})
+	a.netMu.RLock()
+	info := a.netInfo
+	a.netMu.RUnlock()
+	notes, _ := recentAnnotations(r.Context(), a.db, 8)
+	a.render(w, "settings.html", map[string]any{"Profile": profile, "AssetTargets": assetTargets, "CSRF": s.CSRF, "Saved": r.URL.Query().Get("saved") != "", "PiHoleHealth": a.piHoleHealthView(s.CSRF), "Net": info, "Annotations": notes})
 }
 
 type piHoleHealthView struct {

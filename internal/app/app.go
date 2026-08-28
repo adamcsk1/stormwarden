@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -38,6 +37,15 @@ type App struct {
 	piholeHealthMu     sync.RWMutex
 	piholeHealth       piHoleHealthStatus
 	piholeCheck        *piHoleHealthCheck
+	burst              *burstLimiter
+	traceLimit         *burstLimiter
+	ping               pingFn
+	trace              traceFn
+	netMu              sync.RWMutex
+	netInfo            NetInfo
+	ispHop             string
+	baseMu             sync.Mutex
+	baseline           *Baseline
 }
 
 type probeFunc struct {
@@ -140,9 +148,29 @@ func New(cfg Config, logger *slog.Logger) (*App, error) {
 	if lastCacheBustProbe.IsZero() {
 		lastCacheBustProbe = time.Now().Add(-cacheBustInterval)
 	}
+	if cfg.BurstCooldown <= 0 {
+		cfg.BurstCooldown = 2 * time.Minute
+	}
+	if cfg.BurstTimeout <= 0 {
+		cfg.BurstTimeout = 8 * time.Second
+	}
+	if cfg.BurstCount <= 0 {
+		cfg.BurstCount = 10
+	}
+	if cfg.BurstInterval <= 0 {
+		cfg.BurstInterval = 150 * time.Millisecond
+	}
+	if cfg.TracerouteCooldown <= 0 {
+		cfg.TracerouteCooldown = 10 * time.Minute
+	}
+	if cfg.TracerouteMaxHops <= 0 {
+		cfg.TracerouteMaxHops = 15
+	}
 	a := &App{
 		cfg: cfg, db: db, logger: logger, startedAt: time.Now(), sessions: newSessionStore(), exportJobs: make(chan exportJob, 16), loginLimiter: newLoginLimiter(), lastTransfer: lastTransfer, lastAssetProbe: lastAssetProbe, nextCacheBustProbe: lastCacheBustProbe.Add(cacheBustInterval), lastPersist: lastPersist, incidentStates: make(map[string]*incidentState),
+		burst: newBurstLimiter(cfg.BurstCooldown), traceLimit: newBurstLimiter(cfg.TracerouteCooldown),
 	}
+	a.refreshNetInfo()
 	if cfg.PiHoleAPIURL != "" {
 		a.piholeAPI = newPiHoleAPIClient(cfg.PiHoleAPIURL, cfg.PiHoleAPIPassword)
 	}
@@ -178,11 +206,16 @@ func initializeAssetSettings(ctx context.Context, db *sql.DB, configuredDefault 
 
 func (a *App) Close() error { return a.db.Close() }
 
+func (a *App) Annotate(note string) error {
+	return insertAnnotation(context.Background(), a.db, note)
+}
+
 func (a *App) Start(ctx context.Context) {
 	go a.scheduler(ctx)
 	go a.assetScheduler(ctx)
 	go a.maintenance(ctx)
 	go a.exportWorker(ctx)
+	go a.discoverLoop(ctx)
 }
 
 func (a *App) assetScheduler(ctx context.Context) {
@@ -360,10 +393,15 @@ func (a *App) runProbeCycle(ctx context.Context) {
 		{ProbeType: "dns", Target: "pihole-udp", Run: func(probeCtx context.Context) Sample { return probeDNS(probeCtx, "pihole-udp", a.cfg.PiHoleAddr) }},
 		{ProbeType: "dns", Target: "public-dns", Run: func(probeCtx context.Context) Sample { return probeDNS(probeCtx, "public-dns", a.cfg.PublicDNS) }},
 		{ProbeType: "doh", Target: "direct-doh", Run: func(probeCtx context.Context) Sample { return probeDoH(probeCtx, "direct-doh", a.cfg.DoHURL) }},
-		{ProbeType: "tcp", Target: "internet-tcp", Run: func(probeCtx context.Context) Sample { return probeTCP(probeCtx, "internet-tcp", "1.1.1.1:443") }},
 		{ProbeType: "http", Target: "http", Run: func(probeCtx context.Context) Sample {
 			return probeHTTPStatusResolver(probeCtx, "http", a.cfg.HTTPURL, 512, a.cfg.HTTPExpectedStatus, a.cfg.HTTPDNSAddr)
 		}},
+	}
+	for _, control := range a.cfg.tcpControls() {
+		control := control
+		probes = append(probes, probeFunc{ProbeType: "tcp", Target: tcpSampleTarget(control.Name), Run: func(probeCtx context.Context) Sample {
+			return probeTCP(probeCtx, tcpSampleTarget(control.Name), control.Address)
+		}})
 	}
 	samples := runConcurrentProbes(ctx, 10*time.Second, probes)
 	if ctx.Err() != nil {
@@ -382,6 +420,9 @@ func (a *App) runProbeCycle(ctx context.Context) {
 		a.lastTransfer = time.Now()
 	}
 
+	if extra := a.maybeBurst(ctx, samples); len(extra) > 0 {
+		samples = append(samples, extra...)
+	}
 	for _, sample := range samples {
 		if err := insertSample(ctx, a.db, sample); err != nil {
 			a.logger.Error("sample persistence failed", "error", err)
@@ -446,7 +487,15 @@ func (a *App) diagnoseSamples(samples []Sample) (Sample, []Sample, map[string]bo
 	piholeUDP, hasPiHoleUDP := byTarget["pihole-udp"]
 	publicDNS, hasPublic := byTarget["public-dns"]
 	doh, hasDoH := byTarget["direct-doh"]
-	tcp, hasTCP := byTarget["internet-tcp"]
+	var tcpSamples []Sample
+	for _, sample := range samples {
+		if sample.ProbeType == "tcp" {
+			tcpSamples = append(tcpSamples, sample)
+		}
+	}
+	hasTCP := len(tcpSamples) > 0
+	tcp, anyTCPSuccess, allTCPFailed := worstTCP(tcpSamples)
+	diagnosis := classify(Snapshot{Samples: samples, Baseline: a.currentBaseline(context.Background())})
 	var issues []Sample
 	observed := map[string]bool{
 		"local_dns": hasPiHole && hasPiHoleUDP, "external_dns": hasPiHole && hasPiHoleUDP && hasPublic && hasDoH,
@@ -454,7 +503,14 @@ func (a *App) diagnoseSamples(samples []Sample) (Sample, []Sample, map[string]bo
 		"direct_udp_path": hasPublic && hasDoH, "direct_doh_path": hasPublic && hasDoH,
 		"tcp_connect": hasTCP, "internet_outage": hasPiHole && hasPiHoleUDP && hasPublic && hasDoH && hasTCP,
 		"slow_ttfb": hasHTTP, "tls_handshake": hasHTTP, "internet_connectivity": hasHTTP,
-		"slow_transfer": hasTransfer,
+		"slow_transfer":          hasTransfer,
+		"wan_or_isp_packet_loss": hasTCP, "destination_or_route_specific": hasTCP,
+		"tcp_connect_establishment": hasTCP, "tls_or_remote_service": hasHTTP,
+		"http_or_server": hasHTTP, "dns_resolution_failure": hasPublic || hasDoH,
+		"local_network_or_host": true, "host_or_nic": true, "gateway_or_router": true, "unknown": true,
+	}
+	if diagnosis.Classification != "" {
+		observed[diagnosis.Classification] = true
 	}
 	if hasPiHole && hasPiHoleUDP && !pihole.Success && !piholeUDP.Success {
 		category := "local_dns"
@@ -483,17 +539,35 @@ func (a *App) diagnoseSamples(samples []Sample) (Sample, []Sample, map[string]bo
 		issues = append(issues, issue)
 	}
 	if hasTCP && tcp.Severity != Info {
-		issue := incidentSample(tcp, "tcp_connect")
-		issue.Message += tcpControlContext(publicDNS, hasPublic, doh, hasDoH, httpSample, hasHTTP)
+		category := diagnosis.Classification
+		if category == "" || category == "unknown" || category == "local_dns" || category == "dns_resolution_failure" {
+			category = "tcp_connect"
+		}
+		issue := incidentSample(tcp, category)
+		issue.Message = diagnosis.Summary
+		if issue.Message == "" {
+			issue.Message = tcp.Message
+		}
+		issue.Severity = diagnosis.Severity
+		if severityRank(tcp.Severity) > severityRank(issue.Severity) {
+			issue.Severity = tcp.Severity
+		}
+		issue.diagnosis = &diagnosis
 		issues = append(issues, issue)
 	}
-	if hasHTTP && httpSample.Severity != Info && (!hasPiHole || pihole.Success) && (!hasTCP || tcp.Success) {
-		issues = append(issues, incidentSample(httpSample, categoryFor(httpSample)))
+	if hasHTTP && httpSample.Severity != Info && (!hasPiHole || pihole.Success) && (!hasTCP || anyTCPSuccess) {
+		category := categoryFor(httpSample)
+		if diagnosis.Classification == "tls_or_remote_service" || diagnosis.Classification == "http_or_server" {
+			category = diagnosis.Classification
+		}
+		issue := incidentSample(httpSample, category)
+		issue.diagnosis = &diagnosis
+		issues = append(issues, issue)
 	}
 	if hasTransfer && transfer.Severity != Info {
 		issues = append(issues, incidentSample(transfer, "slow_transfer"))
 	}
-	outageEvidence := hasPiHole && hasPiHoleUDP && hasPublic && hasDoH && hasTCP && !pihole.Success && !piholeUDP.Success && !publicDNS.Success && !doh.Success && !tcp.Success
+	outageEvidence := hasPiHole && hasPiHoleUDP && hasPublic && hasDoH && hasTCP && !pihole.Success && !piholeUDP.Success && !publicDNS.Success && !doh.Success && allTCPFailed
 	if outageEvidence {
 		a.criticalCycles++
 	} else {
@@ -505,7 +579,7 @@ func (a *App) diagnoseSamples(samples []Sample) (Sample, []Sample, map[string]bo
 		issues = append(issues, critical)
 	}
 	dnsAvailable := (!hasPiHoleUDP && (!hasPiHole || pihole.Success)) || (hasPiHoleUDP && piholeUDP.Success)
-	available := dnsAvailable && (!hasTCP || tcp.Success) && (!hasHTTP || httpSample.Success)
+	available := dnsAvailable && (!hasTCP || anyTCPSuccess) && (!hasHTTP || httpSample.Success)
 	for _, issue := range issues {
 		if severityRank(issue.Severity) > severityRank(aggregate.Severity) {
 			aggregate = issue
@@ -605,45 +679,71 @@ func (a *App) updateIncidents(ctx context.Context, issues []Sample, observed map
 	}
 }
 
-func tcpControlContext(publicDNS Sample, hasPublic bool, doh Sample, hasDoH bool, httpSample Sample, hasHTTP bool) string {
-	dnsState := controlState(publicDNS, hasPublic, publicDNS.DurationMS)
-	dohState := controlState(doh, hasDoH, doh.DurationMS)
-	httpState := httpConnectState(httpSample, hasHTTP)
-	assessment := "insufficient healthy controls to isolate scope"
-	httpConnectFailed := hasHTTP && httpSample.connectFailed
-	httpConnectHealthy := hasHTTP && httpSample.ConnectMS > 0 && httpSample.ConnectMS <= 250 && !httpConnectFailed
-	if httpConnectHealthy && ((hasPublic && publicDNS.Success) || (hasDoH && doh.Success)) {
-		assessment = "likely Cloudflare TCP control-path degradation, not a broad outage"
-	} else if httpConnectFailed || (hasHTTP && httpSample.ConnectMS > 250) {
-		assessment = "multiple outbound TCP/HTTPS paths degraded; likely broader connectivity trouble"
+func worstTCP(samples []Sample) (Sample, bool, bool) {
+	if len(samples) == 0 {
+		return Sample{}, false, false
 	}
-	return fmt.Sprintf(". Same-cycle controls: direct DNS=%s, DoH=%s, HTTP connect=%s. Assessment: %s", dnsState, dohState, httpState, assessment)
+	worst := samples[0]
+	anyOK, allFailed := false, true
+	for _, sample := range samples {
+		if sample.Success {
+			anyOK, allFailed = true, false
+		}
+		if severityRank(sample.Severity) > severityRank(worst.Severity) {
+			worst = sample
+		}
+	}
+	return worst, anyOK, allFailed
 }
 
-func httpConnectState(sample Sample, present bool) string {
-	if !present || sample.ConnectMS <= 0 {
-		return "unavailable"
+func (a *App) discoverLoop(ctx context.Context) {
+	a.discoverISPHop(ctx)
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.refreshNetInfo()
+			a.discoverISPHop(ctx)
+		}
 	}
-	if sample.connectFailed {
-		return fmt.Sprintf("error (%.0fms)", sample.ConnectMS)
-	}
-	severity, _ := classifyLatency(sample.ConnectMS, "HTTP connection")
-	state := string(severity)
-	if severity == Info {
-		state = "healthy"
-	}
-	return fmt.Sprintf("%s (%.0fms)", state, sample.ConnectMS)
 }
 
-func controlState(sample Sample, present bool, durationMS float64) string {
-	if !present {
-		return "unavailable"
+func (a *App) discoverISPHop(ctx context.Context) {
+	if a.cfg.ISPHopAddr != "" || !a.cfg.ISPHopAuto || !a.cfg.TracerouteEnabled {
+		return
 	}
-	state := string(sample.Severity)
-	if sample.Success && sample.Severity == Info {
-		state = "healthy"
+	trace := a.trace
+	if trace == nil {
+		trace = execTrace
 	}
-	return fmt.Sprintf("%s (%.0fms)", state, durationMS)
+	addr := a.cfg.PingInternetAddr
+	if addr == "" {
+		addr = "1.1.1.1"
+	}
+	traceCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+	sample := trace(traceCtx, addr, min(a.cfg.TracerouteMaxHops, 8))
+	hops := parseTrace(strings.ReplaceAll(sample.Message, " | ", "\n"))
+	if len(hops) == 0 {
+		var rebuilt []traceHop
+		for i, part := range strings.Split(sample.Message, " | ") {
+			fields := strings.Fields(part)
+			if len(fields) >= 2 {
+				rebuilt = append(rebuilt, traceHop{N: i + 1, Addr: fields[len(fields)-1]})
+			}
+		}
+		hops = rebuilt
+	}
+	a.netMu.RLock()
+	gw := a.netInfo.LANGateway
+	a.netMu.RUnlock()
+	if hop := pickISPHop(hops, gw); hop != "" {
+		a.ispHop = hop
+		a.refreshNetInfo()
+	}
 }
 
 func severityRank(s Severity) int {
