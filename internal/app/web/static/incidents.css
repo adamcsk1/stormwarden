@@ -1,3 +1,14 @@
+.pagination {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+#incidents-list {
+  max-height: min(70vh, 720px);
+  overflow: auto;
+}
+
 .incident {
   align-items: flex-start;
 }

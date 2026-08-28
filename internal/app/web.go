@@ -158,6 +158,7 @@ func (a *App) routes() http.Handler {
 	mux.Handle("POST /ui/annotations", a.requireAuth(http.HandlerFunc(a.createAnnotation)))
 	mux.Handle("GET /ui/settings", a.requireAuth(http.HandlerFunc(a.settingsFragment)))
 	mux.Handle("POST /ui/settings", a.requireAuth(http.HandlerFunc(a.saveSettings)))
+	mux.Handle("POST /ui/clear-data", a.requireAuth(http.HandlerFunc(a.clearData)))
 	mux.Handle("POST /ui/pihole-api-health", a.requireAuth(http.HandlerFunc(a.checkPiHoleAPIHealth)))
 	mux.Handle("GET /ui/exports", a.requireAuth(http.HandlerFunc(a.exportsFragment)))
 	mux.Handle("POST /ui/exports", a.requireAuth(http.HandlerFunc(a.createExport)))
@@ -536,7 +537,21 @@ func (a *App) settingsFragment(w http.ResponseWriter, r *http.Request) {
 	info := a.netInfo
 	a.netMu.RUnlock()
 	notes, _ := recentAnnotations(r.Context(), a.db, 8)
-	a.render(w, "settings.html", map[string]any{"Profile": profile, "AssetTargets": assetTargets, "CSRF": s.CSRF, "Saved": r.URL.Query().Get("saved") != "", "PiHoleHealth": a.piHoleHealthView(s.CSRF), "Net": info, "Annotations": notes})
+	a.render(w, "settings.html", map[string]any{"Profile": profile, "AssetTargets": assetTargets, "CSRF": s.CSRF, "Saved": r.URL.Query().Get("saved") != "", "Cleared": r.URL.Query().Get("cleared") != "", "PiHoleHealth": a.piHoleHealthView(s.CSRF), "Net": info, "Annotations": notes})
+}
+
+func (a *App) clearData(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	if err := r.ParseForm(); err != nil || !a.validCSRF(r) {
+		http.Error(w, "invalid request", http.StatusForbidden)
+		return
+	}
+	if err := a.clearRecordedData(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	r.URL.RawQuery = "cleared=1"
+	a.settingsFragment(w, r)
 }
 
 type piHoleHealthView struct {

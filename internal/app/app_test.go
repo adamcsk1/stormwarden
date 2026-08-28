@@ -1006,3 +1006,37 @@ func TestSettingsSaveAssetTargets(t *testing.T) {
 		t.Fatalf("removed asset incident remains active: incidents=%+v state=%+v err=%v", incidents, a.incidentStates["asset_path:Old"], err)
 	}
 }
+
+func TestClearRecordedDataKeepsSettings(t *testing.T) {
+	a := newTestApp(t)
+	if err := insertSample(context.Background(), a.db, Sample{CreatedAt: time.Now(), ProbeType: "tcp", Target: "tcp:cloudflare", Severity: Warning, DurationMS: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	if err := openIncident(context.Background(), a.db, Sample{CreatedAt: time.Now(), ProbeType: "aggregate", Target: "tcp_connect", Severity: Warning, Message: "slow"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := setSetting(context.Background(), a.db, "profile", "detailed"); err != nil {
+		t.Fatal(err)
+	}
+	cookie := login(t, a)
+	s, ok := a.sessions.get(cookie.Value)
+	if !ok {
+		t.Fatal("login session missing")
+	}
+	form := url.Values{"csrf": {s.CSRF}}
+	request := httptest.NewRequest(http.MethodPost, "/ui/clear-data", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	result := httptest.NewRecorder()
+	a.Handler().ServeHTTP(result, request)
+	if result.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", result.Code, result.Body.String())
+	}
+	var samples, incidents int
+	_ = a.db.QueryRow(`SELECT COUNT(*) FROM samples`).Scan(&samples)
+	_ = a.db.QueryRow(`SELECT COUNT(*) FROM incidents`).Scan(&incidents)
+	profile, _ := setting(context.Background(), a.db, "profile")
+	if samples != 0 || incidents != 0 || profile != "detailed" {
+		t.Fatalf("samples=%d incidents=%d profile=%s", samples, incidents, profile)
+	}
+}
