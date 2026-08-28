@@ -507,6 +507,7 @@ func (a *App) compareFragment(w http.ResponseWriter, r *http.Request) {
 		bFrom, bTo = now.Add(-14*24*time.Hour), now.Add(-7*24*time.Hour)
 		labelA, labelB = "this week", "previous week"
 	default:
+		rangeName = "24h"
 		aFrom, aTo = now.Add(-24*time.Hour), now
 		bFrom, bTo = now.Add(-48*time.Hour), now.Add(-24*time.Hour)
 	}
