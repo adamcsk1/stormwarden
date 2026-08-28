@@ -57,7 +57,7 @@ Asset traffic is separate from the selected profile. Configure up to eight targe
 
 Compose uses `network_mode: host` and `cap_add: NET_RAW` so ICMP, traceroute, and LAN-gateway discovery see the real home network instead of the Docker bridge.
 
-Host networking ignores published ports. The process binds `APP_LISTEN_ADDR` (default `:8080`) on the host.
+Host networking ignores published ports. Open `http://LINUX-HOST-IP:8080` (the machine's LAN address). Do not use an old `172.x` container IP.
 
 ```sh
 cp .env.example .env
@@ -84,7 +84,7 @@ docker compose exec stormwarden stormwarden annotate "Disabled Omada IDS/IPS"
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `APP_PASSWORD` | required | UI password |
-| `APP_LISTEN_ADDR` | `:8080` | Bind address (host network) |
+| `APP_PORT` | `8080` | UI listen port on the host (host network) |
 | `PIHOLE_DNS_ADDR` | `127.0.0.1:53` | Pi-hole DNS endpoint |
 | `PIHOLE_API_URL` | disabled | Pi-hole v6 API base URL |
 | `PIHOLE_API_PASSWORD` | disabled | Pi-hole v6 application password |
