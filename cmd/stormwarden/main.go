@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -24,6 +25,19 @@ func main() {
 	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
 		if err := healthcheck(cfg.ListenAddr); err != nil {
 			logger.Error("healthcheck failed", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) >= 3 && os.Args[1] == "annotate" {
+		a, err := app.New(cfg, logger)
+		if err != nil {
+			logger.Error("startup failed", "error", err)
+			os.Exit(1)
+		}
+		defer a.Close()
+		if err := a.Annotate(strings.Join(os.Args[2:], " ")); err != nil {
+			logger.Error("annotate failed", "error", err)
 			os.Exit(1)
 		}
 		return

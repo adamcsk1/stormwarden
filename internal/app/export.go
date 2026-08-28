@@ -212,7 +212,12 @@ func (a *App) writeExport(ctx context.Context, zw *zip.Writer, from, to time.Tim
 	if total > 0 {
 		availability = float64(successful) * 100 / float64(total)
 	}
-	summary := fmt.Sprintf("# Stormwarden Diagnostic Report\n\nObservation period: %s to %s\nGenerated: %s\nTraffic profile: %s\nAsset probes: %d\n\n## Summary\n\n- Health cycles: %d\n- Availability: %.2f%%\n- Warning cycles: %d\n- Error cycles: %d\n- Critical cycles: %d\n- Incidents: %d\n\n## Interpretation\n\nCompare observed behavior across Pi-hole TCP, Pi-hole UDP, direct DNS-over-UDP, direct DNS-over-HTTPS, and configured asset paths. Queries use randomized subdomains to bypass caches; path differences are evidence, not proof of a specific underlying transport cause. HTTP and asset records split DNS, TCP connect, TLS, time-to-first-byte, body transfer speed, and total duration. Aggregate records represent household connectivity per probe cycle.\n\n## Privacy\n\nAuthentication secrets, sessions, cookies, headers, and DNS answers are excluded. Configured targets remain because diagnosis requires them; URL credentials, queries, and fragments are removed.\n", from.In(a.cfg.Timezone).Format(time.RFC3339), to.In(a.cfg.Timezone).Format(time.RFC3339), time.Now().In(a.cfg.Timezone).Format(time.RFC3339), profile, len(assetTargets), total, availability, warnings, errorCount, criticals, incidentCount)
+	cover := computeCoverage(ctx, a.db, from, to, a.startedAt)
+	daily := dailyAnomalyCounts(ctx, a.db, from, to, a.cfg.Timezone)
+	prevFrom := from.Add(-to.Sub(from))
+	left, right := periodStats(ctx, a.db, from, to), periodStats(ctx, a.db, prevFrom, from)
+	notes, _ := listAnnotations(ctx, a.db, from, to, 50)
+	summary := buildExportSummary(a.cfg.Timezone, from, to, profile, len(assetTargets), total, availability, warnings, errorCount, criticals, incidentCount, cover, daily, left, right, notes)
 	if err := zipText(zw, "README.md", "Use summary.md for an overview and the JSONL files for detailed analysis. JSONL contains one JSON object per line. Raw data retains 30 days; rollups preserve older trends.\n"); err != nil {
 		return err
 	}
@@ -235,11 +240,20 @@ func (a *App) writeExport(ctx context.Context, zw *zip.Writer, from, to time.Tim
 	if err := a.zipRollups(ctx, tx, zw, "quarter_hour_rollups_v2", "quarter-hour-rollups.jsonl", fromText, toText); err != nil {
 		return err
 	}
-	settings := map[string]any{"profile": profile, "asset_targets": redactedAssetTargets, "pihole_dns_target": a.cfg.PiHoleAddr, "public_dns_target": a.cfg.PublicDNS, "doh_probe_url": redactURL(a.cfg.DoHURL), "http_dns_target": a.cfg.HTTPDNSAddr, "http_probe_url": redactURL(a.cfg.HTTPURL), "http_expected_status": a.cfg.HTTPExpectedStatus, "transfer_probe_url": redactURL(a.cfg.TransferURL), "raw_retention_days": 30, "rollup_retention": "indefinite", "export_retention_days": 7}
+	if notes == nil {
+		notes = []Annotation{}
+	}
+	if err := zipJSON(zw, "annotations.json", notes); err != nil {
+		return err
+	}
+	settings := map[string]any{"profile": profile, "asset_targets": redactedAssetTargets, "pihole_dns_target": a.cfg.PiHoleAddr, "public_dns_target": a.cfg.PublicDNS, "doh_probe_url": redactURL(a.cfg.DoHURL), "http_dns_target": a.cfg.HTTPDNSAddr, "http_probe_url": redactURL(a.cfg.HTTPURL), "http_expected_status": a.cfg.HTTPExpectedStatus, "transfer_probe_url": redactURL(a.cfg.TransferURL), "tcp_controls": a.cfg.tcpControls(), "gateway_addr": a.cfg.GatewayAddr, "ping_enabled": a.cfg.PingEnabled, "raw_retention_days": 30, "rollup_retention": "indefinite", "export_retention_days": 7}
 	if err := zipJSON(zw, "settings-redacted.json", settings); err != nil {
 		return err
 	}
-	if err := zipJSON(zw, "system-info.json", map[string]any{"go_version": runtime.Version(), "os": runtime.GOOS, "architecture": runtime.GOARCH, "app_uptime": time.Since(a.startedAt).String()}); err != nil {
+	a.netMu.RLock()
+	netInfo := a.netInfo
+	a.netMu.RUnlock()
+	if err := zipJSON(zw, "system-info.json", map[string]any{"go_version": runtime.Version(), "os": runtime.GOOS, "architecture": runtime.GOARCH, "app_uptime": time.Since(a.startedAt).String(), "network": netInfo}); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -292,7 +306,7 @@ func (a *App) zipIncidents(ctx context.Context, tx *sql.Tx, zw *zip.Writer, from
 	encoder = json.NewEncoder(buffer)
 	lastID := int64(0)
 	for {
-		rows, err := tx.QueryContext(ctx, `SELECT id, started_at, ended_at, severity, category, summary, evidence FROM incidents WHERE id>? AND started_at<? AND (ended_at IS NULL OR ended_at>?) ORDER BY id LIMIT 1000`, lastID, to, from)
+		rows, err := tx.QueryContext(ctx, `SELECT `+incidentColumns+` FROM incidents WHERE id>? AND started_at<? AND (ended_at IS NULL OR ended_at>?) ORDER BY id LIMIT 1000`, lastID, to, from)
 		if err != nil {
 			return err
 		}
@@ -414,6 +428,61 @@ func (a *App) zipRollups(ctx context.Context, tx *sql.Tx, zw *zip.Writer, table,
 		}
 	}
 	return rows.Err()
+}
+
+func buildExportSummary(loc *time.Location, from, to time.Time, profile string, assetCount, total int, availability float64, warnings, errorCount, criticals, incidentCount int, cover coverageInfo, daily []dayCount, current, previous compareStats, notes []Annotation) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# Stormwarden Diagnostic Report\n\n")
+	fmt.Fprintf(&b, "Requested period: %s to %s\n", from.In(loc).Format(time.RFC3339), to.In(loc).Format(time.RFC3339))
+	fmt.Fprintf(&b, "Available data: %s to %s\n", formatMaybe(cover.FirstSample, loc), formatMaybe(cover.LastSample, loc))
+	fmt.Fprintf(&b, "Generated: %s\n", time.Now().In(loc).Format(time.RFC3339))
+	fmt.Fprintf(&b, "Application uptime: %s\n", cover.Uptime)
+	fmt.Fprintf(&b, "Data coverage: %.1f%% (%d/%d expected 15s cycles)\n", cover.Percent, cover.Actual, cover.Expected)
+	fmt.Fprintf(&b, "Traffic profile: %s\nAsset probes: %d\n\n## Summary\n\n", profile, assetCount)
+	fmt.Fprintf(&b, "- Health cycles: %d\n- Availability: %.2f%%\n- Warning cycles: %d\n- Error cycles: %d\n- Critical cycles: %d\n- Incidents: %d\n", total, availability, warnings, errorCount, criticals, incidentCount)
+	if len(cover.Gaps) > 0 {
+		b.WriteString("\n## Monitoring gaps\n\n")
+		for _, gap := range cover.Gaps {
+			fmt.Fprintf(&b, "- %s\n", gap)
+		}
+	}
+	if len(daily) > 0 {
+		b.WriteString("\n## TCP connectivity anomalies by day\n\n")
+		var rates []float64
+		for _, day := range daily {
+			fmt.Fprintf(&b, "- %s: %d\n", day.Day, day.Count)
+			rates = append(rates, float64(day.Count))
+		}
+		mid := len(rates) / 2
+		if mid > 0 {
+			if note := rateShift(rates[mid:], rates[:mid]); note != "" {
+				fmt.Fprintf(&b, "\n%s\n", note)
+			}
+		}
+	}
+	b.WriteString("\n## A/B vs previous equal window\n\n")
+	fmt.Fprintf(&b, "- Incidents: %d vs %d\n- TCP median: %.0f ms vs %.0f ms\n- TCP P95: %.0f ms vs %.0f ms\n- DNS fail: %.2f%% vs %.2f%%\n- HTTP connect fail: %.2f%% vs %.2f%%\n", current.Anomalies, previous.Anomalies, current.TCPMedian, previous.TCPMedian, current.TCPP95, previous.TCPP95, current.DNSFailPct, previous.DNSFailPct, current.HTTPConnectFailPct, previous.HTTPConnectFailPct)
+	if len(current.ClassCounts) > 0 {
+		b.WriteString("\n## Incident classifications\n\n")
+		for cat, n := range current.ClassCounts {
+			fmt.Fprintf(&b, "- %s: %d\n", cat, n)
+		}
+	}
+	if len(notes) > 0 {
+		b.WriteString("\n## Configuration-change annotations\n\n")
+		for _, note := range notes {
+			fmt.Fprintf(&b, "- %s %s\n", note.CreatedAt.In(loc).Format(time.RFC3339), note.Note)
+		}
+	}
+	b.WriteString("\n## Interpretation\n\nClassification estimates the lowest healthy layer, then where failure begins. ICMP silence, traceroute non-replies, and ~1s TCP delays are evidence, not proof of packet loss. Path differences are evidence, not proof of a specific transport cause.\n\n## Privacy\n\nAuthentication secrets, sessions, cookies, headers, and DNS answers are excluded. Configured targets remain because diagnosis requires them; URL credentials, queries, and fragments are removed.\n")
+	return b.String()
+}
+
+func formatMaybe(t time.Time, loc *time.Location) string {
+	if t.IsZero() {
+		return "none"
+	}
+	return t.In(loc).Format(time.RFC3339)
 }
 
 func zipText(zw *zip.Writer, name, value string) error {

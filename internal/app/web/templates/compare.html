@@ -1,0 +1,8 @@
+{{define "compare.html"}}<div class="compare"><nav class="pagination"><button hx-get="/ui/compare?range=24h" hx-target="#compare-panel">24h</button><button hx-get="/ui/compare?range=week" hx-target="#compare-panel">Week</button></nav><table class="metrics"><thead><tr><th></th><th>{{.A.Label}}</th><th>{{.B.Label}}</th></tr></thead><tbody>
+<tr><td>Incidents</td><td>{{.A.Anomalies}}</td><td>{{.B.Anomalies}}</td></tr>
+<tr><td>TCP median</td><td>{{f1 .A.TCPMedian}} ms</td><td>{{f1 .B.TCPMedian}} ms</td></tr>
+<tr><td>TCP P95</td><td>{{f1 .A.TCPP95}} ms</td><td>{{f1 .B.TCPP95}} ms</td></tr>
+<tr><td>TCP P99</td><td>{{f1 .A.TCPP99}} ms</td><td>{{f1 .B.TCPP99}} ms</td></tr>
+<tr><td>DNS fail</td><td>{{f1 .A.DNSFailPct}}%</td><td>{{f1 .B.DNSFailPct}}%</td></tr>
+<tr><td>HTTP connect fail</td><td>{{f1 .A.HTTPConnectFailPct}}%</td><td>{{f1 .B.HTTPConnectFailPct}}%</td></tr>
+</tbody></table></div>{{end}}

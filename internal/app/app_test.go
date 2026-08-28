@@ -309,28 +309,34 @@ func TestDiagnosisCorrelatesTCPControls(t *testing.T) {
 		{ProbeType: "dns", Target: "pihole-udp", Severity: Info, Success: true, DurationMS: 10},
 		{ProbeType: "dns", Target: "public-dns", Severity: Info, Success: true, DurationMS: 15},
 		{ProbeType: "doh", Target: "direct-doh", Severity: Info, Success: true, DurationMS: 40},
-		{ProbeType: "tcp", Target: "internet-tcp", Severity: Warning, Success: true, ConnectMS: 1050, Message: "TCP connection above 250 ms to 1.1.1.1:443"},
+		{ProbeType: "tcp", Target: "tcp:cloudflare", Severity: Warning, Success: true, ConnectMS: 1050, DurationMS: 1050, Message: "TCP connection above 250 ms to 1.1.1.1:443"},
+		{ProbeType: "tcp", Target: "tcp:google", Severity: Info, Success: true, ConnectMS: 20, DurationMS: 20},
 		{ProbeType: "http", Target: "http", Severity: Info, Success: true, ConnectMS: 30, DurationMS: 80},
 	}
 	_, issues, _ := a.diagnoseSamples(base)
-	message := issueMessage(issues, "tcp_connect")
-	for _, text := range []string{"1.1.1.1:443", "direct DNS=healthy (15ms)", "HTTP connect=healthy (30ms)", "not a broad outage"} {
-		if !strings.Contains(message, text) {
-			t.Fatalf("TCP correlation missing %q: %s", text, message)
-		}
+	if issueMessage(issues, "destination_or_route_specific") == "" {
+		t.Fatalf("single-target TCP not classified destination-specific: %+v", issues)
 	}
 
-	base[5] = Sample{ProbeType: "http", Target: "http", Severity: Error, ConnectMS: 30, StatusCode: 500, Message: "unexpected status"}
+	base[4] = Sample{ProbeType: "tcp", Target: "tcp:cloudflare", Severity: Warning, Success: true, ConnectMS: 2080, DurationMS: 2080}
+	base[5] = Sample{ProbeType: "tcp", Target: "tcp:google", Severity: Warning, Success: true, ConnectMS: 2090, DurationMS: 2090}
+	base = append(base, Sample{ProbeType: "icmp-burst", Target: "icmp:gateway", Success: true, Mbps: 0, Message: "burst"})
+	base = append(base, Sample{ProbeType: "icmp-burst", Target: "icmp:pihole", Success: true, Mbps: 0, Message: "burst"})
+	base = append(base, Sample{ProbeType: "icmp-burst", Target: "icmp:internet", Success: true, Mbps: 30, Message: "burst"})
 	_, issues, _ = a.diagnoseSamples(base)
-	message = issueMessage(issues, "tcp_connect")
-	if !strings.Contains(message, "HTTP connect=healthy (30ms)") || !strings.Contains(message, "not a broad outage") {
-		t.Fatalf("HTTP application error misclassified as connect failure: %s", message)
+	if issueMessage(issues, "wan_or_isp_packet_loss") == "" {
+		t.Fatalf("multi-target TCP + upstream loss not WAN/ISP: %+v", issues)
 	}
+}
 
-	base[5] = Sample{ProbeType: "http", Target: "http", Severity: Error, ConnectMS: 30, Message: "failed", connectFailed: true}
-	_, issues, _ = a.diagnoseSamples(base)
-	if message = issueMessage(issues, "tcp_connect"); !strings.Contains(message, "broader connectivity trouble") {
-		t.Fatalf("broad TCP degradation not identified: %s", message)
+func TestAnnotate(t *testing.T) {
+	a := newTestApp(t)
+	if err := a.Annotate("Disabled Omada IDS/IPS"); err != nil {
+		t.Fatal(err)
+	}
+	notes, err := recentAnnotations(context.Background(), a.db, 5)
+	if err != nil || len(notes) != 1 || notes[0].Note != "Disabled Omada IDS/IPS" {
+		t.Fatalf("annotations=%+v err=%v", notes, err)
 	}
 }
 
@@ -781,7 +787,7 @@ func TestIncidentPaginationShowsOnlyDirectionalControls(t *testing.T) {
 	a := newTestApp(t)
 	result := httptest.NewRecorder()
 	a.render(result, "incidents.html", map[string]any{
-		"Incidents": []Incident{{StartedAt: time.Now(), Severity: Warning, Category: "tcp_connect", Summary: "slow"}},
+		"Incidents": []incidentView{{Incident: Incident{StartedAt: time.Now(), Severity: Warning, Category: "tcp_connect", Summary: "slow"}}},
 		"Next":      true,
 		"NextPage":  1,
 	})
@@ -790,7 +796,7 @@ func TestIncidentPaginationShowsOnlyDirectionalControls(t *testing.T) {
 		t.Fatalf("unexpected pagination: %s", body)
 	}
 	result = httptest.NewRecorder()
-	a.render(result, "incidents.html", map[string]any{"Incidents": []Incident{{StartedAt: time.Now(), Severity: Warning, Category: "tcp_connect", Summary: "slow"}}})
+	a.render(result, "incidents.html", map[string]any{"Incidents": []incidentView{{Incident: Incident{StartedAt: time.Now(), Severity: Warning, Category: "tcp_connect", Summary: "slow"}}}})
 	if strings.Contains(result.Body.String(), `<nav class="pagination">`) {
 		t.Fatalf("empty pagination rendered: %s", result.Body.String())
 	}

@@ -85,6 +85,9 @@ func probeTCP(ctx context.Context, name, address string) Sample {
 	s.ConnectMS = s.DurationMS
 	if err != nil {
 		s.Severity, s.Message = Error, fmt.Sprintf("TCP %s: %v", address, err)
+		if retransmissionSuspected(s.ConnectMS) {
+			s.Message += " " + retransmissionNote()
+		}
 		return s
 	}
 	_ = conn.Close()
@@ -94,6 +97,9 @@ func probeTCP(ctx context.Context, name, address string) Sample {
 		s.Message = fmt.Sprintf("TCP %s connected", address)
 	} else {
 		s.Message += " to " + address
+	}
+	if retransmissionSuspected(s.ConnectMS) {
+		s.Message += " " + retransmissionNote()
 	}
 	return s
 }

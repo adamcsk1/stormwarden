@@ -3,11 +3,13 @@ name: stormwarden
 services:
   stormwarden:
     build: .
-    ports:
-      - "${APP_PORT:-8080}:8080"
+    network_mode: host
+    cap_add:
+      - NET_RAW
     restart: unless-stopped
     environment:
       APP_PASSWORD: ${APP_PASSWORD:?set APP_PASSWORD in .env}
+      APP_LISTEN_ADDR: ${APP_LISTEN_ADDR:-:8080}
       PIHOLE_DNS_ADDR: ${PIHOLE_DNS_ADDR:?set PIHOLE_DNS_ADDR in .env}
       PIHOLE_API_URL: ${PIHOLE_API_URL:-}
       PIHOLE_API_PASSWORD: ${PIHOLE_API_PASSWORD:-}
@@ -20,8 +22,13 @@ services:
       ASSET_PROBES: ${ASSET_PROBES:-YouTube thumbnail|https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg;Cloudflare cache-busted|cache-bust|https://speed.cloudflare.com/__down?bytes=32768}
       APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Budapest}
       APP_COOKIE_SECURE: ${APP_COOKIE_SECURE:-false}
-      APP_LISTEN_ADDR: :8080
       HTTP_EXPECTED_STATUS: ${HTTP_EXPECTED_STATUS:-204}
+      GATEWAY_ADDR: ${GATEWAY_ADDR:-}
+      ISP_HOP_ADDR: ${ISP_HOP_ADDR:-}
+      ISP_HOP_AUTO: ${ISP_HOP_AUTO:-true}
+      PING_ENABLED: ${PING_ENABLED:-true}
+      PING_INTERNET_ADDR: ${PING_INTERNET_ADDR:-1.1.1.1}
+      TCP_CONTROLS: ${TCP_CONTROLS:-cloudflare|1.1.1.1:443;google|8.8.8.8:443;quad9|9.9.9.9:443}
     volumes:
       - ./data:/data
     read_only: true
@@ -29,4 +36,3 @@ services:
       - /tmp:size=16m
     security_opt:
       - no-new-privileges:true
-
