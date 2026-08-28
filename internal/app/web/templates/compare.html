@@ -1,4 +1,4 @@
-{{define "compare.html"}}<div class="compare"><nav class="pagination"><button hx-get="/ui/compare?range=24h" hx-target="#compare-panel">24h</button><button hx-get="/ui/compare?range=week" hx-target="#compare-panel">Week</button></nav><table class="metrics"><thead><tr><th></th><th>{{.A.Label}}</th><th>{{.B.Label}}</th></tr></thead><tbody>
+{{define "compare.html"}}<div class="compare"><nav class="pagination"><button hx-get="/ui/compare?range=24h" hx-target="#compare-panel"{{if ne .Range "24h"}} class="quiet"{{end}}>24h</button><button hx-get="/ui/compare?range=week" hx-target="#compare-panel"{{if ne .Range "week"}} class="quiet"{{end}}>Week</button></nav><table class="metrics"><thead><tr><th></th><th>{{.A.Label}}</th><th>{{.B.Label}}</th></tr></thead><tbody>
 <tr><td>Incidents</td><td>{{.A.Anomalies}}</td><td>{{.B.Anomalies}}</td></tr>
 <tr><td>TCP median</td><td>{{f1 .A.TCPMedian}} ms</td><td>{{f1 .B.TCPMedian}} ms</td></tr>
 <tr><td>TCP P95</td><td>{{f1 .A.TCPP95}} ms</td><td>{{f1 .B.TCPP95}} ms</td></tr>
