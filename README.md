@@ -55,9 +55,7 @@ Asset traffic is separate from the selected profile. Configure up to eight targe
 
 ## Run
 
-Compose uses `network_mode: host` and `cap_add: NET_RAW` so ICMP, traceroute, and LAN-gateway discovery see the real home network instead of the Docker bridge.
-
-Host networking ignores published ports. Open `http://LINUX-HOST-IP:8080` (the machine's LAN address). Do not use an old `172.x` container IP.
+Compose publishes the UI on `APP_PORT` (default `8080`) and adds `NET_RAW` for ICMP. Set `GATEWAY_ADDR` to the LAN router; the container default route is the Docker bridge.
 
 ```sh
 cp .env.example .env
@@ -68,8 +66,6 @@ docker compose up -d --build
 ```
 
 Open `http://HOST-IP:8080`.
-
-Linux Docker is the supported ICMP path. Docker Desktop on Windows/Mac does not provide equivalent host networking.
 
 For HTTPS behind reverse proxy, set `APP_COOKIE_SECURE=true`. Do not expose the UI to the internet.
 
@@ -84,7 +80,7 @@ docker compose exec stormwarden stormwarden annotate "Disabled Omada IDS/IPS"
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `APP_PASSWORD` | required | UI password |
-| `APP_PORT` | `8080` | UI listen port on the host (host network) |
+| `APP_PORT` | `8080` | Host port published for the UI |
 | `PIHOLE_DNS_ADDR` | `127.0.0.1:53` | Pi-hole DNS endpoint |
 | `PIHOLE_API_URL` | disabled | Pi-hole v6 API base URL |
 | `PIHOLE_API_PASSWORD` | disabled | Pi-hole v6 application password |
@@ -136,14 +132,11 @@ TCP connect times near 1s / 2s / 3s / 4s timeout are tagged as consistent with S
 
 ## Docker networking
 
-Default compose is host network plus `NET_RAW`.
+Default compose publishes the UI and adds `NET_RAW` for ICMP. The container default route is the Docker bridge; set `GATEWAY_ADDR` to the LAN router.
 
-- Host network: default route is the LAN gateway, not `docker0`.
 - `NET_RAW`: unprivileged ICMP ping/traceroute.
-- Without those, ICMP samples record `icmp_unavailable` and classification continues from TCP/DNS/HTTP only.
-- Do not run privileged. Interface stats use `/sys/class/net` and do not need extra capabilities.
-
-If the UI shows a 172.16/12 default gateway, Stormwarden is still on a Docker bridge. Set `GATEWAY_ADDR` to the LAN router and use host networking.
+- Without it, ICMP samples record `icmp_unavailable`; TCP/DNS/HTTP classification still runs.
+- Do not run privileged. Interface stats use `/sys/class/net`.
 
 ## ISP-hop discovery
 
@@ -190,5 +183,5 @@ go run ./cmd/stormwarden
 ## Current Limits
 
 - No modem/router radio metrics yet. Weather or 4G/5G signal causation needs RSRP, RSRQ, SINR, band, and cell data from a router API.
-- ICMP and traceroute need Linux host networking plus `NET_RAW`.
+- ICMP and traceroute need `NET_RAW`. Set `GATEWAY_ADDR` when running on the Docker bridge.
 - In-memory sessions expire on application restart, requiring login again.
