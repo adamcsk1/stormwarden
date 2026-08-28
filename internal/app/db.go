@@ -636,6 +636,24 @@ func recentAnnotations(ctx context.Context, db *sql.DB, limit int) ([]Annotation
 	return listAnnotations(ctx, db, time.Unix(0, 0), time.Now().Add(time.Minute), limit)
 }
 
+func clearRecordedData(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, table := range []string{
+		"samples", "incidents",
+		"quarter_hour_rollups", "hourly_rollups", "daily_rollups",
+		"quarter_hour_rollups_v2", "hourly_rollups_v2", "daily_rollups_v2",
+	} {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM `+table); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func cleanup(ctx context.Context, db *sql.DB, rawRetention time.Duration) error {
 	cutoff := dbTime(time.Now().UTC().Truncate(15 * time.Minute).Add(-rawRetention))
 	tx, err := db.BeginTx(ctx, nil)

@@ -210,6 +210,22 @@ func (a *App) Annotate(note string) error {
 	return insertAnnotation(context.Background(), a.db, note)
 }
 
+func (a *App) clearRecordedData(ctx context.Context) error {
+	a.dataMu.Lock()
+	defer a.dataMu.Unlock()
+	a.incidentMu.Lock()
+	defer a.incidentMu.Unlock()
+	if err := clearRecordedData(ctx, a.db); err != nil {
+		return err
+	}
+	a.incidentStates = make(map[string]*incidentState)
+	a.criticalCycles = 0
+	a.baseMu.Lock()
+	a.baseline = nil
+	a.baseMu.Unlock()
+	return nil
+}
+
 func (a *App) Start(ctx context.Context) {
 	go a.scheduler(ctx)
 	go a.assetScheduler(ctx)
