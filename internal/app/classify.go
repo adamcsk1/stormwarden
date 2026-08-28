@@ -76,13 +76,6 @@ func classify(s Snapshot) Diagnosis {
 			Summary:  "Local NIC or host path likely: interface error/drop counters rose while LAN pings also lost packets.",
 		})
 	}
-	if e.nicRising() {
-		return e.finish(Diagnosis{
-			Classification: "host_or_nic", Confidence: "medium", Severity: Error,
-			Evidence: e.collect(e.nic.Message),
-			Summary:  "Local NIC counters increased. Host, cable, or driver problem possible; LAN vs NIC not fully separable.",
-		})
-	}
 
 	if e.hasPihole && e.hasPiholeUDP && !e.pihole.Success && !e.piholeUDP.Success && e.publicOK() && e.dohOK() {
 		conf, extra := "medium", []string{}
@@ -235,6 +228,9 @@ func icmpClause(loss float64) string {
 }
 
 func (e extracted) finish(d Diagnosis) Diagnosis {
+	if e.nicRising() && e.nic != nil && d.Classification != "host_or_nic" {
+		d.Evidence = append(d.Evidence, e.nic.Message)
+	}
 	if e.baseline != nil && d.Classification != "unknown" {
 		if note := e.baseline.note(e); note != "" {
 			d.Evidence = append(d.Evidence, note)

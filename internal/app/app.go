@@ -757,7 +757,9 @@ func (a *App) discoverISPHop(ctx context.Context) {
 	gw := a.netInfo.LANGateway
 	a.netMu.RUnlock()
 	if hop := pickISPHop(hops, gw); hop != "" {
+		a.netMu.Lock()
 		a.ispHop = hop
+		a.netMu.Unlock()
 		a.refreshNetInfo()
 	}
 }

@@ -52,6 +52,7 @@ type pingFn func(ctx context.Context, addr string, count int, interval, perPacke
 type traceFn func(ctx context.Context, addr string, maxHops int) Sample
 
 func (a *App) pingTargets() []struct{ name, addr string } {
+	a.netMu.RLock()
 	gateway := a.cfg.GatewayAddr
 	if gateway == "" {
 		gateway = a.netInfo.LANGateway
@@ -60,6 +61,7 @@ func (a *App) pingTargets() []struct{ name, addr string } {
 	if isp == "" {
 		isp = a.ispHop
 	}
+	a.netMu.RUnlock()
 	targets := []struct{ name, addr string }{
 		{"pihole", a.cfg.PingPiholeAddr},
 		{"gateway", gateway},
@@ -105,13 +107,16 @@ func (a *App) maybeBurst(ctx context.Context, samples []Sample) []Sample {
 	defer a.burst.done()
 	burstCtx, cancel := context.WithTimeout(ctx, a.cfg.BurstTimeout)
 	defer cancel()
+	a.netMu.RLock()
+	iface := a.netInfo.DefaultIface
+	a.netMu.RUnlock()
 	var nicBefore map[string]int64
 	if a.cfg.NICStatsEnabled {
-		nicBefore = readNIC(a.netInfo.DefaultIface)
+		nicBefore = readNIC(iface)
 	}
 	extra := a.runPingBursts(burstCtx)
 	if a.cfg.NICStatsEnabled {
-		if delta := nicDeltaSample(a.netInfo.DefaultIface, nicBefore, readNIC(a.netInfo.DefaultIface)); delta != nil {
+		if delta := nicDeltaSample(iface, nicBefore, readNIC(iface)); delta != nil {
 			extra = append(extra, *delta)
 		}
 	}
@@ -245,8 +250,12 @@ func parsePing(text string, count int) (sent, recv int, loss, minMS, avgMS, maxM
 		}
 		if strings.Contains(line, "Minimum =") {
 			minMS = firstFloat(line, minMS)
-			avgMS = firstFloat(strings.ToLower(line)[strings.Index(strings.ToLower(line), "average"):], avgMS)
-			maxMS = firstFloat(line[strings.Index(line, "Maximum"):], maxMS)
+			if i := strings.Index(strings.ToLower(line), "average"); i >= 0 {
+				avgMS = firstFloat(line[i:], avgMS)
+			}
+			if i := strings.Index(line, "Maximum"); i >= 0 {
+				maxMS = firstFloat(line[i:], maxMS)
+			}
 		}
 	}
 	if sent > 0 && loss == 0 && recv >= 0 {
@@ -260,7 +269,11 @@ func parseRTT(line string) (minMS, avgMS, maxMS, jitter float64) {
 	if len(parts) < 2 {
 		return
 	}
-	fields := strings.Split(strings.TrimSpace(strings.Fields(parts[len(parts)-1])[0]), "/")
+	right := strings.Fields(parts[len(parts)-1])
+	if len(right) == 0 {
+		return
+	}
+	fields := strings.Split(right[0], "/")
 	if len(fields) >= 3 {
 		minMS, _ = strconv.ParseFloat(fields[0], 64)
 		avgMS, _ = strconv.ParseFloat(fields[1], 64)
@@ -424,7 +437,11 @@ func (a *App) refreshNetInfo() {
 		if dockerLike(gw) {
 			info.DockerGateway = gw
 			info.HostNetwork = false
-			info.Note = "Default route looks like a Docker bridge. Set GATEWAY_ADDR to the LAN router and prefer host networking."
+			if a.cfg.GatewayAddr == "" {
+				info.Note = "Docker bridge is the container default route. Set GATEWAY_ADDR to the LAN router."
+			} else {
+				info.Note = "Container default route is the Docker bridge; LAN gateway is from GATEWAY_ADDR."
+			}
 		}
 	} else {
 		info.Note = "Gateway auto-discover unavailable: " + err.Error()
@@ -437,12 +454,12 @@ func (a *App) refreshNetInfo() {
 	} else if a.cfg.GatewayAddr == "" && info.DockerGateway != "" {
 		info.Note = "Docker bridge gateway detected; set GATEWAY_ADDR to the LAN router."
 	}
+	a.netMu.Lock()
 	if a.cfg.ISPHopAddr != "" {
 		info.ISPHop = a.cfg.ISPHopAddr
 	} else {
 		info.ISPHop = a.ispHop
 	}
-	a.netMu.Lock()
 	a.netInfo = info
 	a.netMu.Unlock()
 }
