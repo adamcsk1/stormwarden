@@ -4,9 +4,23 @@
   margin-bottom: 12px;
 }
 
-#incidents-list {
-  max-height: min(70vh, 720px);
+.panel.wide {
+  display: flex;
+  flex-direction: column;
+  height: 0;
+  min-height: 100%;
+  min-width: 0;
+}
+
+.panel-body {
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: auto;
+}
+
+.panel.wide .table-wrap {
+  max-height: none;
+  overflow: visible;
 }
 
 .incident {
