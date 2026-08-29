@@ -831,6 +831,20 @@ func TestDNSPathFragmentMarksStaleSamples(t *testing.T) {
 	}
 }
 
+func TestWidePanelScrollDoesNotCollapseOnMobile(t *testing.T) {
+	css, err := webFiles.ReadFile("web/static/incidents.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(css)
+	if !strings.Contains(text, "@media (min-width: 851px)") || !strings.Contains(text, "height: 0") {
+		t.Fatal("wide panel stretch is not desktop-only")
+	}
+	if !strings.Contains(text, "@media (max-width: 850px)") || !strings.Contains(text, "max-height: min(70vh, 720px)") {
+		t.Fatal("mobile panel-body lacks a scroll cap")
+	}
+}
+
 func TestDNSPathBadgeDoesNotStretch(t *testing.T) {
 	css, err := webFiles.ReadFile("web/static/dns-paths.css")
 	if err != nil {
