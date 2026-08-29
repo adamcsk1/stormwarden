@@ -500,6 +500,47 @@ func TestAvailabilityUsesAggregateCyclesOnly(t *testing.T) {
 	}
 }
 
+func TestSummaryCountsIncidentsNotAggregateBlips(t *testing.T) {
+	a := newTestApp(t)
+	now := time.Now()
+	_ = insertSample(context.Background(), a.db, Sample{CreatedAt: now, ProbeType: "aggregate", Target: "internet", Severity: Error, Success: false})
+	_ = insertSample(context.Background(), a.db, Sample{CreatedAt: now, ProbeType: "aggregate", Target: "internet", Severity: Warning, Success: true})
+	summary, err := a.dashboardSummary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Warnings24 != 0 || summary.Errors24 != 0 {
+		t.Fatalf("1-cycle blips counted as incidents: %+v", summary)
+	}
+
+	bad := Sample{ProbeType: "aggregate", Target: "local_dns", Severity: Error, Message: "Pi-hole failed"}
+	a.updateIncident(context.Background(), bad)
+	a.updateIncident(context.Background(), bad)
+	warn := Sample{ProbeType: "aggregate", Target: "slow_ttfb", Severity: Warning, Message: "slow"}
+	a.updateIncident(context.Background(), warn)
+	a.updateIncident(context.Background(), warn)
+	summary, err = a.dashboardSummary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Warnings24 != 1 || summary.Errors24 != 1 {
+		t.Fatalf("incident counts: warnings=%d errors=%d", summary.Warnings24, summary.Errors24)
+	}
+
+	old := dbTime(now.Add(-48 * time.Hour))
+	_, err = a.db.Exec(`INSERT INTO incidents(started_at, ended_at, severity, category, summary) VALUES (?, ?, 'error', 'tcp_connect', 'old')`, old, old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary, err = a.dashboardSummary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Warnings24 != 1 || summary.Errors24 != 1 {
+		t.Fatalf("closed 48h incident counted: warnings=%d errors=%d", summary.Warnings24, summary.Errors24)
+	}
+}
+
 func TestCleanupRollsUpRawData(t *testing.T) {
 	a := newTestApp(t)
 	old := Sample{CreatedAt: time.Now().Add(-31 * 24 * time.Hour), ProbeType: "aggregate", Target: "internet", Severity: Info, Success: true, DurationMS: 10}

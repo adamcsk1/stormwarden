@@ -292,15 +292,20 @@ func (a *App) summaryFragment(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) dashboardSummary(ctx context.Context) (DashboardSummary, error) {
 	s := DashboardSummary{Severity: Info, Status: "Collecting data", Availability24: 100}
+	cutoff := dbTime(time.Now().Add(-24 * time.Hour))
 	var total, successful int
-	err := a.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(success),0),
-COALESCE(SUM(severity='warning'),0), COALESCE(SUM(severity='error'),0), COALESCE(SUM(severity='critical'),0)
-FROM samples WHERE probe_type='aggregate' AND created_at >= ?`, dbTime(time.Now().Add(-24*time.Hour))).Scan(&total, &successful, &s.Warnings24, &s.Errors24, &s.Critical24)
+	err := a.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(success),0)
+FROM samples WHERE probe_type='aggregate' AND created_at >= ?`, cutoff).Scan(&total, &successful)
 	if err != nil {
 		return s, err
 	}
 	if total > 0 {
 		s.Availability24 = float64(successful) * 100 / float64(total)
+	}
+	err = a.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(severity='warning'),0), COALESCE(SUM(severity='error'),0), COALESCE(SUM(severity='critical'),0)
+FROM incidents WHERE started_at>=? OR ended_at IS NULL OR ended_at>=?`, cutoff, cutoff).Scan(&s.Warnings24, &s.Errors24, &s.Critical24)
+	if err != nil {
+		return s, err
 	}
 	var last string
 	var severity Severity
