@@ -522,6 +522,47 @@ func zipJSON(zw *zip.Writer, name string, value any) error {
 	return encoder.Encode(value)
 }
 
+func (a *App) deleteExport(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil || !a.validCSRF(r) {
+		http.Error(w, "invalid request", http.StatusForbidden)
+		return
+	}
+	id := r.PathValue("id")
+	var path string
+	err := a.db.QueryRowContext(r.Context(), `SELECT path FROM exports WHERE id=?`, id).Scan(&path)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := a.removeExport(id, path); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	a.renderExports(w, r, "export-list")
+}
+
+func (a *App) removeExport(id, path string) error {
+	if path != "" {
+		cleanDir, dirErr := filepath.Abs(a.cfg.ExportDir)
+		cleanPath, pathErr := filepath.Abs(path)
+		if dirErr != nil {
+			return dirErr
+		}
+		if pathErr != nil || !strings.HasPrefix(cleanPath, cleanDir+string(os.PathSeparator)) {
+			return errors.New("invalid export path")
+		}
+		if err := os.Remove(cleanPath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	_, err := a.db.Exec(`DELETE FROM exports WHERE id=?`, id)
+	return err
+}
+
 func (a *App) downloadExport(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var path, rangeName, status string

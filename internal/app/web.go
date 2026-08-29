@@ -162,6 +162,7 @@ func (a *App) routes() http.Handler {
 	mux.Handle("POST /ui/pihole-api-health", a.requireAuth(http.HandlerFunc(a.checkPiHoleAPIHealth)))
 	mux.Handle("GET /ui/exports", a.requireAuth(http.HandlerFunc(a.exportsFragment)))
 	mux.Handle("POST /ui/exports", a.requireAuth(http.HandlerFunc(a.createExport)))
+	mux.Handle("POST /ui/exports/{id}/delete", a.requireAuth(http.HandlerFunc(a.deleteExport)))
 	mux.Handle("GET /exports/{id}/download", a.requireAuth(http.HandlerFunc(a.downloadExport)))
 	return securityHeaders(mux)
 }
