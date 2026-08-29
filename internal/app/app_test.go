@@ -541,6 +541,25 @@ func TestSummaryCountsIncidentsNotAggregateBlips(t *testing.T) {
 	}
 }
 
+func TestRecentDegradedSamplesSkipsHealthyAndOld(t *testing.T) {
+	a := newTestApp(t)
+	now := time.Now()
+	_ = insertSample(context.Background(), a.db, Sample{CreatedAt: now, ProbeType: "dns", Target: "pihole", Severity: Info, Success: true, Message: "healthy"})
+	_ = insertSample(context.Background(), a.db, Sample{CreatedAt: now.Add(-10 * time.Minute), ProbeType: "doh", Target: "direct-doh", Severity: Warning, Success: true, Message: "slow"})
+	_ = insertSample(context.Background(), a.db, Sample{CreatedAt: now.Add(-23 * time.Hour), ProbeType: "aggregate", Target: "internet", Severity: Error, Success: false, Message: "failed"})
+	_ = insertSample(context.Background(), a.db, Sample{CreatedAt: now.Add(-48 * time.Hour), ProbeType: "tcp", Target: "tcp:cloudflare", Severity: Error, Success: false, Message: "too old"})
+	samples, err := recentDegradedSamples(context.Background(), a.db, now.Add(-24*time.Hour), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 2 {
+		t.Fatalf("got %d samples: %+v", len(samples), samples)
+	}
+	if samples[0].Severity != Warning || samples[1].Severity != Error {
+		t.Fatalf("order/severity: %+v", samples)
+	}
+}
+
 func TestCleanupRollsUpRawData(t *testing.T) {
 	a := newTestApp(t)
 	old := Sample{CreatedAt: time.Now().Add(-31 * 24 * time.Hour), ProbeType: "aggregate", Target: "internet", Severity: Info, Success: true, DurationMS: 10}

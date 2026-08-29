@@ -321,7 +321,7 @@ FROM incidents WHERE started_at>=? OR ended_at IS NULL OR ended_at>=?`, cutoff, 
 }
 
 func (a *App) metricsFragment(w http.ResponseWriter, r *http.Request) {
-	samples, err := recentSamples(r.Context(), a.db, time.Now().Add(-time.Hour), 100)
+	samples, err := recentDegradedSamples(r.Context(), a.db, time.Now().Add(-24*time.Hour), 100)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
