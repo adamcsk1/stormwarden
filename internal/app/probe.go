@@ -18,18 +18,34 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
 )
 
 const maxDNSMessageSize = 65535
+const probeCleanupMargin = 500 * time.Millisecond
 
+var (
+	probeCancellationTotal        atomic.Int64
+	probeCancellationTimeoutTotal atomic.Int64
+	probeInternalErrorTotal       atomic.Int64
+)
+
+// sharedDoHClient is a long-lived Direct DoH client. DisableKeepAlives is
+// intentional: this probe measures a fresh TCP/TLS control path (SYN/TLS),
+// not keep-alive application DoH. Phase timeouts are bounded; the probe
+// context remains the overall deadline. Do not set Client.Timeout.
 var sharedDoHClient = &http.Client{Transport: &http.Transport{
-	MaxIdleConns:        4,
-	MaxIdleConnsPerHost: 2,
-	IdleConnTimeout:     90 * time.Second,
-	TLSHandshakeTimeout: 4 * time.Second,
+	DialContext:           (&net.Dialer{Timeout: 4 * time.Second}).DialContext,
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          4,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   4 * time.Second,
+	ResponseHeaderTimeout: 4 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+	DisableKeepAlives:     true,
 }}
 
 type connectionTrace struct {
@@ -75,6 +91,186 @@ func (t *connectionTrace) duration() float64 {
 		return t.success
 	}
 	return t.failed
+}
+
+type phaseTrace struct {
+	mu                     sync.Mutex
+	stage                  string
+	started                map[string]time.Time
+	probeStart             time.Time
+	dnsStart, tlsStart     time.Time
+	wroteRequest           time.Time
+	dnsMS, tlsMS, ttfbMS   float64
+	connectOK, connectFail float64
+	connected              bool
+}
+
+func newPhaseTrace(started time.Time) *phaseTrace {
+	return &phaseTrace{started: make(map[string]time.Time), probeStart: started}
+}
+
+func (t *phaseTrace) setStage(stage string) {
+	t.mu.Lock()
+	t.stage = stage
+	t.mu.Unlock()
+}
+
+func (t *phaseTrace) currentStage() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.stage
+}
+
+func (t *phaseTrace) apply(s *Sample) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	s.ProbeStage = t.stage
+	s.DNSMS = t.dnsMS
+	s.TLSMS = t.tlsMS
+	s.TTFBMS = t.ttfbMS
+	if t.connected {
+		s.ConnectMS = t.connectOK
+	} else {
+		s.ConnectMS = t.connectFail
+	}
+}
+
+func (t *phaseTrace) clientTrace() *httptrace.ClientTrace {
+	return &httptrace.ClientTrace{
+		DNSStart: func(httptrace.DNSStartInfo) {
+			t.mu.Lock()
+			t.stage = stageDNS
+			t.dnsStart = time.Now()
+			t.mu.Unlock()
+		},
+		DNSDone: func(httptrace.DNSDoneInfo) {
+			t.mu.Lock()
+			if !t.dnsStart.IsZero() {
+				t.dnsMS = ms(time.Since(t.dnsStart))
+			}
+			t.mu.Unlock()
+		},
+		ConnectStart: func(network, address string) {
+			t.mu.Lock()
+			t.stage = stageConnect
+			t.started[network+"\x00"+address] = time.Now()
+			t.mu.Unlock()
+		},
+		ConnectDone: func(network, address string, err error) {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+			key := network + "\x00" + address
+			started := t.started[key]
+			delete(t.started, key)
+			if started.IsZero() {
+				return
+			}
+			d := ms(time.Since(started))
+			if err == nil {
+				t.connectOK = d
+				t.connected = true
+			} else if d > t.connectFail {
+				t.connectFail = d
+			}
+		},
+		TLSHandshakeStart: func() {
+			t.mu.Lock()
+			t.stage = stageTLS
+			t.tlsStart = time.Now()
+			t.mu.Unlock()
+		},
+		TLSHandshakeDone: func(tls.ConnectionState, error) {
+			t.mu.Lock()
+			if !t.tlsStart.IsZero() {
+				t.tlsMS = ms(time.Since(t.tlsStart))
+			}
+			t.mu.Unlock()
+		},
+		GotConn: func(httptrace.GotConnInfo) {
+			t.mu.Lock()
+			if t.stage == stageConnect || t.stage == stageTLS || t.stage == stageDNS || t.stage == "" {
+				t.stage = stageRequest
+			}
+			t.mu.Unlock()
+		},
+		WroteRequest: func(httptrace.WroteRequestInfo) {
+			t.mu.Lock()
+			t.stage = stageRequest
+			t.wroteRequest = time.Now()
+			t.mu.Unlock()
+		},
+		GotFirstResponseByte: func() {
+			t.mu.Lock()
+			t.stage = stageTTFB
+			if t.wroteRequest.IsZero() {
+				t.ttfbMS = ms(time.Since(t.probeStart))
+			} else {
+				t.ttfbMS = ms(time.Since(t.wroteRequest))
+			}
+			t.mu.Unlock()
+		},
+	}
+}
+
+func probeWorkingTimeout(timeout time.Duration) time.Duration {
+	if timeout > 2*probeCleanupMargin {
+		return timeout - probeCleanupMargin
+	}
+	working := timeout * 3 / 4
+	if working < time.Millisecond {
+		return timeout
+	}
+	return working
+}
+
+func timeoutForStage(stage string) string {
+	switch stage {
+	case stageConnect:
+		return networkTCPConnectTimeout
+	case stageTLS:
+		return networkTLSHandshakeTimeout
+	case stageRequest, stageTTFB:
+		return networkResponseHeaderTimeout
+	case stageBody:
+		return networkResponseReadTimeout
+	default:
+		return networkRequestTimeout
+	}
+}
+
+func classifyDoHError(err error, probeCtx context.Context, stage, endpoint string) (network, control, message string) {
+	message = redactHTTPError(err, endpoint)
+	if errors.Is(err, context.Canceled) {
+		return networkParentCancelled, probeCancelledCleanly, message
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return timeoutForStage(stage), probeCompleted, message
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return timeoutForStage(stage), probeCompleted, message
+	}
+	if probeCtx != nil && probeCtx.Err() != nil {
+		if errors.Is(probeCtx.Err(), context.Canceled) {
+			return networkParentCancelled, probeCancelledCleanly, message
+		}
+		if errors.Is(probeCtx.Err(), context.DeadlineExceeded) {
+			return timeoutForStage(stage), probeCompleted, message
+		}
+	}
+	return networkTransportError, probeCompleted, message
+}
+
+func countProbeControl(control string) {
+	switch control {
+	case probeCancelledCleanly:
+		probeCancellationTotal.Add(1)
+	case probeCancellationTimeout:
+		probeCancellationTotal.Add(1)
+		probeCancellationTimeoutTotal.Add(1)
+	case probeInternalError:
+		probeInternalErrorTotal.Add(1)
+	}
 }
 
 func probeTCP(ctx context.Context, name, address string) Sample {
@@ -163,74 +359,83 @@ func probeDNSTCP(ctx context.Context, target, address string) Sample {
 
 func probeDoH(ctx context.Context, target, endpoint string) Sample {
 	started := time.Now()
-	s := Sample{CreatedAt: started, ProbeType: "doh", Target: target, Severity: Info}
+	s := Sample{CreatedAt: started, ProbeType: "doh", Target: target, Severity: Info, ProbeControl: probeCompleted}
 	id, _, query, err := newDNSQuery()
 	if err != nil {
 		s.Severity, s.Message = Error, err.Error()
+		s.NetworkResult, s.ProbeControl = networkUnknown, probeInternalError
+		countProbeControl(s.ProbeControl)
 		return s
 	}
-	connections := newConnectionTrace()
-	var tlsStart, wroteRequest time.Time
-	trace := &httptrace.ClientTrace{
-		ConnectStart:      connections.start,
-		ConnectDone:       connections.done,
-		TLSHandshakeStart: func() { tlsStart = time.Now() },
-		TLSHandshakeDone: func(tls.ConnectionState, error) {
-			if !tlsStart.IsZero() {
-				s.TLSMS = ms(time.Since(tlsStart))
-			}
-		},
-		WroteRequest: func(httptrace.WroteRequestInfo) { wroteRequest = time.Now() },
-		GotFirstResponseByte: func() {
-			if wroteRequest.IsZero() {
-				s.TTFBMS = ms(time.Since(started))
-			} else {
-				s.TTFBMS = ms(time.Since(wroteRequest))
-			}
-		},
-	}
-	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), http.MethodPost, endpoint, bytes.NewReader(query))
+	phases := newPhaseTrace(started)
+	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, phases.clientTrace()), http.MethodPost, endpoint, bytes.NewReader(query))
 	if err != nil {
 		s.Severity, s.Message = Error, redactHTTPError(err, endpoint)
+		s.NetworkResult, s.ProbeControl = networkUnknown, probeInternalError
+		countProbeControl(s.ProbeControl)
 		return s
 	}
 	req.Header.Set("Accept", "application/dns-message")
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("User-Agent", "stormwarden/1.0")
+	phases.setStage(stageConnect)
 	resp, err := sharedDoHClient.Do(req)
-	s.ConnectMS = connections.duration()
+	phases.apply(&s)
+	s.DurationMS = ms(time.Since(started))
+	s.DNSMS = s.DurationMS
 	if err != nil {
-		s.DurationMS = ms(time.Since(started))
-		s.Severity, s.Message = Error, redactHTTPError(err, endpoint)
+		s.NetworkResult, s.ProbeControl, s.Message = classifyDoHError(err, ctx, phases.currentStage(), endpoint)
+		if s.ProbeControl == probeCancelledCleanly {
+			s.Severity = Warning
+			if s.NetworkResult == networkParentCancelled {
+				s.Message = "parent context cancelled"
+			}
+		} else {
+			s.Severity = Error
+		}
+		countProbeControl(s.ProbeControl)
 		return s
 	}
 	defer resp.Body.Close()
-	s.DurationMS, s.DNSMS = ms(time.Since(started)), ms(time.Since(started))
 	s.StatusCode = resp.StatusCode
 	if resp.StatusCode != http.StatusOK {
 		s.Severity, s.Message = Error, fmt.Sprintf("unexpected DoH status %d", resp.StatusCode)
+		s.NetworkResult = networkHTTPStatusError
 		return s
 	}
 	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/dns-message" {
 		s.Severity, s.Message = Error, "invalid DoH content type"
+		s.NetworkResult = networkDNSProtocolError
 		return s
 	}
+	phases.setStage(stageBody)
+	s.ProbeStage = stageBody
 	response, err := io.ReadAll(io.LimitReader(resp.Body, maxDNSMessageSize+1))
 	s.DurationMS, s.DNSMS = ms(time.Since(started)), ms(time.Since(started))
 	if err != nil {
-		s.Severity, s.Message = Error, err.Error()
+		s.NetworkResult, s.ProbeControl, s.Message = classifyDoHError(err, ctx, stageBody, endpoint)
+		if s.ProbeControl == probeCancelledCleanly {
+			s.Severity = Warning
+		} else {
+			s.Severity = Error
+		}
+		countProbeControl(s.ProbeControl)
 		return s
 	}
 	if len(response) > maxDNSMessageSize {
 		s.Severity, s.Message = Error, "oversized DoH response"
+		s.NetworkResult = networkDNSProtocolError
 		return s
 	}
 	if err := validateDNSResponse(response, query, id); err != nil {
 		s.Severity, s.Message = Error, err.Error()
+		s.NetworkResult = networkDNSProtocolError
 		return s
 	}
 	s.Success = true
+	s.NetworkResult = networkSuccess
+	s.ProbeControl = probeCompleted
 	s.Severity, s.Message = classifyLatency(s.DurationMS, "DoH response")
 	if s.Severity == Info {
 		s.Message = dnsSuccessMessage(response, "doh")
@@ -392,7 +597,7 @@ func probeHTTPStatusResolver(ctx context.Context, probeType, url string, limit i
 		return s
 	}
 	req.Header.Set("User-Agent", "stormwarden/1.0")
-	dialer := &net.Dialer{}
+	dialer := &net.Dialer{Timeout: 4 * time.Second}
 	if dnsAddress != "" {
 		dialer.Resolver = &net.Resolver{PreferGo: true, Dial: func(resolveCtx context.Context, network, _ string) (net.Conn, error) {
 			if strings.HasPrefix(network, "udp") {

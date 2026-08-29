@@ -308,7 +308,7 @@ func (e extracted) dnsMostlyOK() bool {
 		has bool
 		s   Sample
 	}{{e.hasPihole, e.pihole}, {e.hasPiholeUDP, e.piholeUDP}, {e.hasPublic, e.publicDNS}, {e.hasDoH, e.doh}} {
-		if !pair.has {
+		if !pair.has || (probeHealthIssue(pair.s) && !confirmedNetworkFailure(pair.s)) {
 			continue
 		}
 		n++
@@ -326,11 +326,11 @@ func (e extracted) dnsFailed() bool {
 		has bool
 		s   Sample
 	}{{e.hasPihole, e.pihole}, {e.hasPiholeUDP, e.piholeUDP}, {e.hasPublic, e.publicDNS}, {e.hasDoH, e.doh}} {
-		if !pair.has {
+		if !pair.has || (probeHealthIssue(pair.s) && !confirmedNetworkFailure(pair.s)) {
 			continue
 		}
 		n++
-		if !pair.s.Success {
+		if confirmedNetworkFailure(pair.s) || !pair.s.Success {
 			fails++
 		}
 	}

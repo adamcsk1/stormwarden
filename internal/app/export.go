@@ -353,20 +353,21 @@ type rollup struct {
 }
 
 type dnsPathSummary struct {
-	Target        string  `json:"target"`
-	Samples       int     `json:"samples"`
-	Successes     int     `json:"successes"`
-	AvgDurationMS float64 `json:"avg_duration_ms"`
+	Target          string  `json:"target"`
+	Samples         int     `json:"samples"`
+	Successes       int     `json:"successes"`
+	MonitorFailures int     `json:"monitor_failures,omitempty"`
+	AvgDurationMS   float64 `json:"avg_duration_ms"`
 }
 
 func loadDNSPathSummaries(ctx context.Context, tx *sql.Tx, from, to string) ([]dnsPathSummary, error) {
 	type accumulator struct {
-		samples, successes int
-		totalDuration      float64
+		samples, successes, monitor int
+		totalDuration               float64
 	}
 	values := make(map[string]accumulator)
 	queries := []string{
-		`SELECT target, COUNT(*), SUM(success), SUM(duration_ms) FROM samples WHERE target IN ('pihole','pihole-udp','public-dns','direct-doh') AND created_at>=? AND created_at<? GROUP BY target`,
+		`SELECT target, COUNT(*), SUM(success), SUM(duration_ms) FROM samples WHERE target IN ('pihole','pihole-udp','public-dns','direct-doh') AND created_at>=? AND created_at<? AND probe_control NOT IN ('cancellation_timeout','internal_error') GROUP BY target`,
 		`SELECT target, SUM(samples), SUM(successes), SUM(avg_duration_ms*samples) FROM quarter_hour_rollups_v2 WHERE target IN ('pihole','pihole-udp','public-dns','direct-doh') AND bucket>=? AND bucket<? GROUP BY target`,
 	}
 	for _, query := range queries {
@@ -390,6 +391,24 @@ func loadDNSPathSummaries(ctx context.Context, tx *sql.Tx, from, to string) ([]d
 			return nil, err
 		}
 	}
+	rows, err := tx.QueryContext(ctx, `SELECT target, COUNT(*) FROM samples WHERE target IN ('pihole','pihole-udp','public-dns','direct-doh') AND created_at>=? AND created_at<? AND probe_control IN ('cancellation_timeout','internal_error') GROUP BY target`, from, to)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var target string
+		var monitor int
+		if err := rows.Scan(&target, &monitor); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		value := values[target]
+		value.monitor += monitor
+		values[target] = value
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
 	keys := make([]string, 0, len(values))
 	for target := range values {
 		keys = append(keys, target)
@@ -402,7 +421,7 @@ func loadDNSPathSummaries(ctx context.Context, tx *sql.Tx, from, to string) ([]d
 		if value.samples > 0 {
 			average = value.totalDuration / float64(value.samples)
 		}
-		result = append(result, dnsPathSummary{Target: target, Samples: value.samples, Successes: value.successes, AvgDurationMS: average})
+		result = append(result, dnsPathSummary{Target: target, Samples: value.samples, Successes: value.successes, MonitorFailures: value.monitor, AvgDurationMS: average})
 	}
 	return result, nil
 }

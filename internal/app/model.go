@@ -1,6 +1,9 @@
 package app
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 type Severity string
 
@@ -27,12 +30,84 @@ type Sample struct {
 	Mbps            float64   `json:"mbps,omitempty"`
 	StatusCode      int       `json:"status_code,omitempty"`
 	Message         string    `json:"message,omitempty"`
+	NetworkResult   string    `json:"network_result,omitempty"`
+	ProbeControl    string    `json:"probe_control,omitempty"`
+	ProbeStage      string    `json:"probe_stage,omitempty"`
 	connectFailed   bool
 	dnsQueryName    string
 	dnsQueryAt      time.Time
 	incidentContext string
 	diagnosis       *Diagnosis
 }
+
+const (
+	networkSuccess               = "success"
+	networkTCPConnectTimeout     = "tcp_connect_timeout"
+	networkTLSHandshakeTimeout   = "tls_handshake_timeout"
+	networkResponseHeaderTimeout = "response_header_timeout"
+	networkRequestTimeout        = "request_timeout"
+	networkResponseReadTimeout   = "response_read_timeout"
+	networkDNSProtocolError      = "dns_protocol_error"
+	networkHTTPStatusError       = "http_status_error"
+	networkTransportError        = "transport_error"
+	networkParentCancelled       = "parent_context_cancelled"
+	networkUnknown               = "unknown"
+
+	probeCompleted           = "completed"
+	probeCancelledCleanly    = "cancelled_cleanly"
+	probeCancellationTimeout = "cancellation_timeout"
+	probeInternalError       = "internal_error"
+
+	stageDNS     = "dns"
+	stageConnect = "connect"
+	stageTLS     = "tls"
+	stageRequest = "request"
+	stageTTFB    = "ttfb"
+	stageBody    = "body"
+)
+
+func probeHealthIssue(s Sample) bool {
+	return s.ProbeControl == probeCancellationTimeout || s.ProbeControl == probeInternalError
+}
+
+func measurementOK(s Sample) bool {
+	return s.Success || (probeHealthIssue(s) && !confirmedNetworkFailure(s))
+}
+
+func confirmedNetworkFailure(s Sample) bool {
+	switch s.NetworkResult {
+	case networkSuccess:
+		return false
+	case networkUnknown, networkParentCancelled:
+		return false
+	case "":
+		if probeHealthIssue(s) {
+			return false
+		}
+		return !s.Success
+	default:
+		return true
+	}
+}
+
+func (s Sample) NetworkLabel() string {
+	if s.NetworkResult == "" {
+		if s.Success {
+			return "success"
+		}
+		return "unknown"
+	}
+	return strings.ReplaceAll(s.NetworkResult, "_", " ")
+}
+
+func (s Sample) ControlLabel() string {
+	if s.ProbeControl == "" {
+		return "completed"
+	}
+	return strings.ReplaceAll(s.ProbeControl, "_", " ")
+}
+
+func (s Sample) IsProbeHealth() bool { return probeHealthIssue(s) }
 
 type Incident struct {
 	ID             int64      `json:"id"`

@@ -137,7 +137,7 @@ func TestDoHProbeAcceptsNXDOMAIN(t *testing.T) {
 	}))
 	defer server.Close()
 	sample := probeDoH(context.Background(), "direct-doh", server.URL)
-	if !sample.Success || sample.ProbeType != "doh" || !strings.Contains(sample.Message, "NXDOMAIN") {
+	if !sample.Success || sample.ProbeType != "doh" || !strings.Contains(sample.Message, "NXDOMAIN") || sample.NetworkResult != networkSuccess || sample.ProbeControl != probeCompleted {
 		t.Fatalf("DoH result: %+v", sample)
 	}
 }
@@ -149,7 +149,7 @@ func TestDoHProbeValidatesHTTPResponse(t *testing.T) {
 	}))
 	defer server.Close()
 	sample := probeDoH(context.Background(), "direct-doh", server.URL)
-	if sample.Success || sample.StatusCode != http.StatusBadGateway {
+	if sample.Success || sample.StatusCode != http.StatusBadGateway || sample.NetworkResult != networkHTTPStatusError {
 		t.Fatalf("invalid DoH HTTP result: %+v", sample)
 	}
 }
@@ -189,8 +189,11 @@ func TestProbeCycleEnforcesDeadline(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > 150*time.Millisecond {
 		t.Fatalf("deadline not enforced: %v", elapsed)
 	}
-	if len(result) != 1 || result[0].Target != "pihole" || result[0].ProbeType != "dns" || result[0].Severity != Error {
+	if len(result) != 1 || result[0].Target != "pihole" || result[0].ProbeType != "dns" || result[0].ProbeControl != probeCancellationTimeout {
 		t.Fatalf("missing timeout result: %+v", result)
+	}
+	if confirmedNetworkFailure(result[0]) {
+		t.Fatalf("lifecycle timeout counted as network failure: %+v", result[0])
 	}
 }
 
