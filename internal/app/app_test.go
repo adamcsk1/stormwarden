@@ -677,6 +677,75 @@ func TestExpiredExportCleanupDoesNotDeadlock(t *testing.T) {
 	}
 }
 
+func TestDeleteExportRemovesFileAndRow(t *testing.T) {
+	a := newTestApp(t)
+	path := filepath.Join(a.cfg.ExportDir, "keep.zip")
+	if err := os.WriteFile(path, []byte("zip"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = a.db.Exec(`INSERT INTO exports(id, created_at, range_name, path, size, status) VALUES ('del-me', ?, 'day', ?, 3, 'complete')`, dbTime(time.Now()), path)
+	cookie := login(t, a)
+	s, ok := a.sessions.get(cookie.Value)
+	if !ok {
+		t.Fatal("session missing")
+	}
+	form := url.Values{"csrf": {s.CSRF}}
+	request := httptest.NewRequest(http.MethodPost, "/ui/exports/del-me/delete", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	result := httptest.NewRecorder()
+	a.Handler().ServeHTTP(result, request)
+	if result.Code != http.StatusOK {
+		t.Fatalf("delete status = %d body=%s", result.Code, result.Body.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("export file remains")
+	}
+	var n int
+	_ = a.db.QueryRow(`SELECT COUNT(*) FROM exports WHERE id='del-me'`).Scan(&n)
+	if n != 0 {
+		t.Fatal("export row remains")
+	}
+	if strings.Contains(result.Body.String(), "del-me") {
+		t.Fatalf("deleted export still listed: %s", result.Body.String())
+	}
+}
+
+func TestDeleteExportRejectsPathEscapeAndBadCSRF(t *testing.T) {
+	a := newTestApp(t)
+	outside := filepath.Join(t.TempDir(), "secret.zip")
+	if err := os.WriteFile(outside, []byte("no"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = a.db.Exec(`INSERT INTO exports(id, created_at, range_name, path, size, status) VALUES ('evil', ?, 'day', ?, 2, 'complete')`, dbTime(time.Now()), outside)
+	cookie := login(t, a)
+	s, ok := a.sessions.get(cookie.Value)
+	if !ok {
+		t.Fatal("session missing")
+	}
+	form := url.Values{"csrf": {s.CSRF}}
+	request := httptest.NewRequest(http.MethodPost, "/ui/exports/evil/delete", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	result := httptest.NewRecorder()
+	a.Handler().ServeHTTP(result, request)
+	if result.Code != http.StatusForbidden {
+		t.Fatalf("escaped path status = %d", result.Code)
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Fatal("outside file was removed")
+	}
+
+	bad := httptest.NewRequest(http.MethodPost, "/ui/exports/evil/delete", strings.NewReader("csrf=wrong"))
+	bad.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	bad.AddCookie(cookie)
+	denied := httptest.NewRecorder()
+	a.Handler().ServeHTTP(denied, bad)
+	if denied.Code != http.StatusForbidden {
+		t.Fatalf("bad CSRF status = %d", denied.Code)
+	}
+}
+
 func TestExportContainsBoundedAIData(t *testing.T) {
 	a := newTestApp(t)
 	inside := Sample{CreatedAt: time.Now(), ProbeType: "aggregate", Target: "internet", Severity: Info, Success: true, Message: "inside"}

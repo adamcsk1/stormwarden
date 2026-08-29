@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -402,23 +401,9 @@ func (a *App) cleanupExports() {
 		}
 	}
 	_ = rows.Close()
-	cleanDir, err := filepath.Abs(a.cfg.ExportDir)
-	if err != nil {
-		a.logger.Error("export cleanup path failed", "error", err)
-		return
-	}
 	for _, item := range expired {
-		cleanPath, pathErr := filepath.Abs(item.path)
-		if pathErr != nil || !strings.HasPrefix(cleanPath, cleanDir+string(os.PathSeparator)) {
-			a.logger.Error("export cleanup rejected path", "path", item.path)
-			continue
-		}
-		if removeErr := os.Remove(cleanPath); removeErr != nil && !os.IsNotExist(removeErr) {
-			a.logger.Error("export cleanup file failed", "path", cleanPath, "error", removeErr)
-			continue
-		}
-		if _, deleteErr := a.db.Exec(`DELETE FROM exports WHERE id=?`, item.id); deleteErr != nil {
-			a.logger.Error("export cleanup record failed", "id", item.id, "error", deleteErr)
+		if err := a.removeExport(item.id, item.path); err != nil {
+			a.logger.Error("export cleanup failed", "id", item.id, "error", err)
 		}
 	}
 }
