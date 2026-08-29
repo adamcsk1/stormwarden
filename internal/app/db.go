@@ -63,7 +63,10 @@ CREATE TABLE IF NOT EXISTS samples (
   bytes INTEGER NOT NULL DEFAULT 0,
   mbps REAL NOT NULL DEFAULT 0,
   status_code INTEGER NOT NULL DEFAULT 0,
-  message TEXT NOT NULL DEFAULT ''
+  message TEXT NOT NULL DEFAULT '',
+  network_result TEXT NOT NULL DEFAULT '',
+  probe_control TEXT NOT NULL DEFAULT '',
+  probe_stage TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_samples_created ON samples(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_samples_severity ON samples(severity, created_at DESC);
@@ -138,6 +141,15 @@ CREATE TABLE IF NOT EXISTS daily_rollups_v2 (
 		return err
 	}
 	if err := ensureColumn(db, "incidents", "contradictions", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "samples", "network_result", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "samples", "probe_control", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "samples", "probe_stage", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS annotations (
@@ -294,9 +306,9 @@ func applyPrivacyMigration(db *sql.DB, exportDir string) error {
 
 func insertSample(ctx context.Context, db *sql.DB, s Sample) error {
 	_, err := db.ExecContext(ctx, `INSERT INTO samples
-(created_at, probe_type, target, severity, success, duration_ms, dns_ms, connect_ms, tls_ms, ttfb_ms, bytes, mbps, status_code, message)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, dbTime(s.CreatedAt), s.ProbeType,
-		s.Target, s.Severity, s.Success, s.DurationMS, s.DNSMS, s.ConnectMS, s.TLSMS, s.TTFBMS, s.Bytes, s.Mbps, s.StatusCode, s.Message)
+(created_at, probe_type, target, severity, success, duration_ms, dns_ms, connect_ms, tls_ms, ttfb_ms, bytes, mbps, status_code, message, network_result, probe_control, probe_stage)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, dbTime(s.CreatedAt), s.ProbeType,
+		s.Target, s.Severity, s.Success, s.DurationMS, s.DNSMS, s.ConnectMS, s.TLSMS, s.TTFBMS, s.Bytes, s.Mbps, s.StatusCode, s.Message, s.NetworkResult, s.ProbeControl, s.ProbeStage)
 	return err
 }
 
@@ -304,7 +316,7 @@ func scanSample(rows interface{ Scan(...any) error }) (Sample, error) {
 	var s Sample
 	var created string
 	err := rows.Scan(&s.ID, &created, &s.ProbeType, &s.Target, &s.Severity, &s.Success, &s.DurationMS,
-		&s.DNSMS, &s.ConnectMS, &s.TLSMS, &s.TTFBMS, &s.Bytes, &s.Mbps, &s.StatusCode, &s.Message)
+		&s.DNSMS, &s.ConnectMS, &s.TLSMS, &s.TTFBMS, &s.Bytes, &s.Mbps, &s.StatusCode, &s.Message, &s.NetworkResult, &s.ProbeControl, &s.ProbeStage)
 	if err != nil {
 		return s, err
 	}
@@ -312,7 +324,7 @@ func scanSample(rows interface{ Scan(...any) error }) (Sample, error) {
 	return s, err
 }
 
-const sampleColumns = `id, created_at, probe_type, target, severity, success, duration_ms, dns_ms, connect_ms, tls_ms, ttfb_ms, bytes, mbps, status_code, message`
+const sampleColumns = `id, created_at, probe_type, target, severity, success, duration_ms, dns_ms, connect_ms, tls_ms, ttfb_ms, bytes, mbps, status_code, message, network_result, probe_control, probe_stage`
 
 func recentSamples(ctx context.Context, db *sql.DB, since time.Time, limit int) ([]Sample, error) {
 	rows, err := db.QueryContext(ctx, `SELECT `+sampleColumns+` FROM samples WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?`, dbTime(since), limit)
@@ -668,7 +680,7 @@ func cleanup(ctx context.Context, db *sql.DB, rawRetention time.Duration) error 
 	} {
 		query := fmt.Sprintf(`INSERT INTO %s(bucket, probe_type, target, samples, successes, warnings, errors, criticals, avg_duration_ms, avg_dns_ms, avg_connect_ms, avg_tls_ms, avg_ttfb_ms, avg_mbps)
 SELECT %s, probe_type, target, COUNT(*), SUM(success), SUM(severity='warning'), SUM(severity='error'), SUM(severity='critical'), AVG(duration_ms), AVG(dns_ms), AVG(connect_ms), AVG(tls_ms), AVG(ttfb_ms), AVG(mbps)
-FROM samples WHERE created_at < ? GROUP BY 1, 2, 3
+FROM samples WHERE created_at < ? AND probe_control NOT IN ('cancellation_timeout','internal_error') GROUP BY 1, 2, 3
 ON CONFLICT(bucket, probe_type, target) DO UPDATE SET
 samples=samples+excluded.samples, successes=successes+excluded.successes, warnings=warnings+excluded.warnings,
 errors=errors+excluded.errors, criticals=criticals+excluded.criticals,

@@ -61,9 +61,11 @@ type probeResult struct {
 
 func runConcurrentProbes(ctx context.Context, timeout time.Duration, probes []probeFunc) []Sample {
 	sampleChannel := make(chan probeResult, len(probes))
+	working := probeWorkingTimeout(timeout)
+	started := time.Now()
 	for index, probe := range probes {
 		go func() {
-			probeCtx, cancel := context.WithTimeout(ctx, timeout)
+			probeCtx, cancel := context.WithTimeout(ctx, working)
 			defer cancel()
 			sampleChannel <- probeResult{index: index, sample: probe.Run(probeCtx)}
 		}()
@@ -94,9 +96,32 @@ func runConcurrentProbes(ctx context.Context, timeout time.Duration, probes []pr
 				}
 			}
 			for index, probe := range probes {
-				if !received[index] {
-					samples[index] = Sample{CreatedAt: time.Now(), ProbeType: probe.ProbeType, Target: probe.Target, Severity: Error, Message: "probe did not stop before deadline"}
+				if received[index] {
+					continue
 				}
+				elapsed := time.Since(started)
+				samples[index] = Sample{
+					CreatedAt:     time.Now(),
+					ProbeType:     probe.ProbeType,
+					Target:        probe.Target,
+					Severity:      Warning,
+					DurationMS:    ms(elapsed),
+					Message:       "probe did not terminate after cancellation",
+					NetworkResult: networkUnknown,
+					ProbeControl:  probeCancellationTimeout,
+				}
+				countProbeControl(probeCancellationTimeout)
+				slog.Warn("probe cancellation timeout",
+					"probe", probe.ProbeType,
+					"target", probe.Target,
+					"elapsed_ms", ms(elapsed),
+					"probe_deadline", working,
+					"parent_deadline", timeout,
+					"cleanup_ms", ms(elapsed-working),
+					"context_cancelled", ctx.Err() != nil,
+					"context_error", ctx.Err(),
+					"outstanding", true,
+				)
 			}
 			return samples
 		}
@@ -309,6 +334,11 @@ func (a *App) runAssetProbeCycleAt(ctx context.Context, cycleAt time.Time) {
 		name := assetSampleName(sample.Target)
 		category := categories[name]
 		observed[category] = true
+		if probeHealthIssue(sample) {
+			observed["probe_health"] = true
+			issues = appendProbeHealth(issues, sample, name+" asset")
+			continue
+		}
 		if sample.Severity != Info {
 			issue := incidentSample(sample, category)
 			issue.Message = name + " asset path degraded: " + sample.Message
@@ -524,37 +554,42 @@ func (a *App) diagnoseSamples(samples []Sample) (Sample, []Sample, map[string]bo
 		"tcp_connect_establishment": hasTCP, "tls_or_remote_service": hasHTTP,
 		"http_or_server": hasHTTP, "dns_resolution_failure": hasPublic || hasDoH,
 		"local_network_or_host": true, "host_or_nic": true, "gateway_or_router": true, "unknown": true,
+		"probe_health": true,
 	}
 	if diagnosis.Classification != "" {
 		observed[diagnosis.Classification] = true
 	}
-	if hasPiHole && hasPiHoleUDP && !pihole.Success && !piholeUDP.Success {
+	if hasPiHole && hasPiHoleUDP && confirmedNetworkFailure(pihole) && confirmedNetworkFailure(piholeUDP) {
 		category := "local_dns"
-		if hasPublic && hasDoH && !publicDNS.Success && !doh.Success {
+		if hasPublic && hasDoH && confirmedNetworkFailure(publicDNS) && confirmedNetworkFailure(doh) {
 			category = "external_dns"
 		}
 		issues = append(issues, incidentSample(pihole, category))
-	} else if hasPiHoleUDP && piholeUDP.Severity != Info {
+	} else if hasPiHoleUDP && pathDegraded(piholeUDP) {
 		issue := incidentSample(piholeUDP, "pihole_udp_path")
 		issue.Message = "Pi-hole UDP path degraded: " + piholeUDP.Message
 		issues = append(issues, issue)
 	}
-	if hasPiHole && pihole.Severity != Info && !(hasPiHoleUDP && !pihole.Success && !piholeUDP.Success) {
+	if hasPiHole && pathDegraded(pihole) && !(hasPiHoleUDP && confirmedNetworkFailure(pihole) && confirmedNetworkFailure(piholeUDP)) {
 		issue := incidentSample(pihole, "pihole_tcp_path")
 		issue.Message = "Pi-hole TCP path degraded: " + pihole.Message
 		issues = append(issues, issue)
 	}
-	if hasPublic && publicDNS.Severity != Info {
+	if hasPublic && pathDegraded(publicDNS) {
 		issue := incidentSample(publicDNS, "direct_udp_path")
 		issue.Message = "Direct UDP DNS path degraded: " + publicDNS.Message
 		issues = append(issues, issue)
 	}
-	if hasDoH && doh.Severity != Info {
+	if hasDoH && pathDegraded(doh) {
 		issue := incidentSample(doh, "direct_doh_path")
 		issue.Message = "Direct DoH path degraded: " + doh.Message
 		issues = append(issues, issue)
 	}
-	if hasTCP && tcp.Severity != Info {
+	issues = appendProbeHealth(issues, pihole, "Pi-hole TCP")
+	issues = appendProbeHealth(issues, piholeUDP, "Pi-hole UDP")
+	issues = appendProbeHealth(issues, publicDNS, "Direct UDP DNS")
+	issues = appendProbeHealth(issues, doh, "Direct DoH")
+	if hasTCP && pathDegraded(tcp) {
 		category := diagnosis.Classification
 		if category == "" || category == "unknown" || category == "local_dns" || category == "dns_resolution_failure" {
 			category = "tcp_connect"
@@ -571,7 +606,8 @@ func (a *App) diagnoseSamples(samples []Sample) (Sample, []Sample, map[string]bo
 		issue.diagnosis = &diagnosis
 		issues = append(issues, issue)
 	}
-	if hasHTTP && httpSample.Severity != Info && (!hasPiHole || pihole.Success) && (!hasTCP || anyTCPSuccess) {
+	issues = appendProbeHealth(issues, tcp, "TCP")
+	if hasHTTP && pathDegraded(httpSample) && (!hasPiHole || pihole.Success) && (!hasTCP || anyTCPSuccess) {
 		category := categoryFor(httpSample)
 		if diagnosis.Classification == "tls_or_remote_service" || diagnosis.Classification == "http_or_server" {
 			category = diagnosis.Classification
@@ -580,10 +616,14 @@ func (a *App) diagnoseSamples(samples []Sample) (Sample, []Sample, map[string]bo
 		issue.diagnosis = &diagnosis
 		issues = append(issues, issue)
 	}
-	if hasTransfer && transfer.Severity != Info {
+	if hasHTTP {
+		issues = appendProbeHealth(issues, httpSample, "HTTP")
+	}
+	if hasTransfer && pathDegraded(transfer) {
 		issues = append(issues, incidentSample(transfer, "slow_transfer"))
 	}
-	outageEvidence := hasPiHole && hasPiHoleUDP && hasPublic && hasDoH && hasTCP && !pihole.Success && !piholeUDP.Success && !publicDNS.Success && !doh.Success && allTCPFailed
+	issues = appendProbeHealth(issues, transfer, "Transfer")
+	outageEvidence := hasPiHole && hasPiHoleUDP && hasPublic && hasDoH && hasTCP && confirmedNetworkFailure(pihole) && confirmedNetworkFailure(piholeUDP) && confirmedNetworkFailure(publicDNS) && confirmedNetworkFailure(doh) && allTCPFailed
 	if outageEvidence {
 		a.criticalCycles++
 	} else {
@@ -594,9 +634,12 @@ func (a *App) diagnoseSamples(samples []Sample) (Sample, []Sample, map[string]bo
 		critical.Severity, critical.Message = Critical, "Pi-hole DNS, direct UDP DNS, DNS-over-HTTPS, and direct TCP failed for consecutive cycles"
 		issues = append(issues, critical)
 	}
-	dnsAvailable := (!hasPiHoleUDP && (!hasPiHole || pihole.Success)) || (hasPiHoleUDP && piholeUDP.Success)
-	available := dnsAvailable && (!hasTCP || anyTCPSuccess) && (!hasHTTP || httpSample.Success)
+	dnsAvailable := (!hasPiHoleUDP && (!hasPiHole || measurementOK(pihole))) || (hasPiHoleUDP && measurementOK(piholeUDP))
+	available := dnsAvailable && (!hasTCP || anyTCPSuccess) && (!hasHTTP || measurementOK(httpSample))
 	for _, issue := range issues {
+		if issue.Target == "probe_health" {
+			continue
+		}
 		if severityRank(issue.Severity) > severityRank(aggregate.Severity) {
 			aggregate = issue
 		}
@@ -611,6 +654,24 @@ func (a *App) diagnoseSamples(samples []Sample) (Sample, []Sample, map[string]bo
 func incidentSample(source Sample, category string) Sample {
 	source.CreatedAt, source.ProbeType, source.Target = time.Now(), "aggregate", category
 	return source
+}
+
+func pathDegraded(s Sample) bool {
+	return s.Severity != Info && (confirmedNetworkFailure(s) || !probeHealthIssue(s))
+}
+
+func appendProbeHealth(issues []Sample, source Sample, name string) []Sample {
+	if !probeHealthIssue(source) {
+		return issues
+	}
+	issue := incidentSample(source, "probe_health")
+	issue.Severity = Warning
+	msg := source.Message
+	if msg == "" {
+		msg = "probe did not terminate after cancellation"
+	}
+	issue.Message = name + " probe internal/lifecycle error: " + msg
+	return append(issues, issue)
 }
 
 func (a *App) updateIncident(ctx context.Context, sample Sample) {
@@ -702,7 +763,7 @@ func worstTCP(samples []Sample) (Sample, bool, bool) {
 	worst := samples[0]
 	anyOK, allFailed := false, true
 	for _, sample := range samples {
-		if sample.Success {
+		if measurementOK(sample) {
 			anyOK, allFailed = true, false
 		}
 		if severityRank(sample.Severity) > severityRank(worst.Severity) {
