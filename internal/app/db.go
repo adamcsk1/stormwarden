@@ -326,8 +326,12 @@ func scanSample(rows interface{ Scan(...any) error }) (Sample, error) {
 
 const sampleColumns = `id, created_at, probe_type, target, severity, success, duration_ms, dns_ms, connect_ms, tls_ms, ttfb_ms, bytes, mbps, status_code, message, network_result, probe_control, probe_stage`
 
-func recentSamples(ctx context.Context, db *sql.DB, since time.Time, limit int) ([]Sample, error) {
-	rows, err := db.QueryContext(ctx, `SELECT `+sampleColumns+` FROM samples WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?`, dbTime(since), limit)
+func recentDegradedSamples(ctx context.Context, db *sql.DB, since time.Time, limit int) ([]Sample, error) {
+	return listSamples(ctx, db, `SELECT `+sampleColumns+` FROM samples WHERE created_at >= ? AND severity != 'info' ORDER BY created_at DESC LIMIT ?`, dbTime(since), limit)
+}
+
+func listSamples(ctx context.Context, db *sql.DB, query string, args ...any) ([]Sample, error) {
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
