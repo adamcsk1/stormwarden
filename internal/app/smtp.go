@@ -307,6 +307,20 @@ func mailHost() string {
 	return host
 }
 
+func (a *App) sendTestMail() error {
+	if !a.cfg.smtpEnabled() {
+		return errors.New("not configured")
+	}
+	a.mailMu.Lock()
+	defer a.mailMu.Unlock()
+	body := fmt.Sprintf("stormwarden on %s\nSMTP test.\n", mailHost())
+	send := a.sendMail
+	if send == nil {
+		send = func(subject, body string) error { return sendSMTP(a.cfg, subject, body) }
+	}
+	return send("[stormwarden] test email", body)
+}
+
 func (a *App) queueMail() {
 	if !a.cfg.smtpEnabled() {
 		return

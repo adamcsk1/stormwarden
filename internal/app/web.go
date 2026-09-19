@@ -164,6 +164,7 @@ func (a *App) routes() http.Handler {
 	mux.Handle("POST /ui/clear-data", a.requireAuth(http.HandlerFunc(a.clearData)))
 	mux.Handle("POST /ui/pihole-api-health", a.requireAuth(http.HandlerFunc(a.checkPiHoleAPIHealth)))
 	mux.Handle("POST /ui/teltonika-health", a.requireAuth(http.HandlerFunc(a.checkTeltonikaHealth)))
+	mux.Handle("POST /ui/smtp-health", a.requireAuth(http.HandlerFunc(a.checkSMTPHealth)))
 	mux.Handle("GET /ui/exports", a.requireAuth(http.HandlerFunc(a.exportsFragment)))
 	mux.Handle("POST /ui/exports", a.requireAuth(http.HandlerFunc(a.createExport)))
 	mux.Handle("POST /ui/exports/{id}/delete", a.requireAuth(http.HandlerFunc(a.deleteExport)))
@@ -603,7 +604,7 @@ func (a *App) settingsFragment(w http.ResponseWriter, r *http.Request) {
 	info := a.netInfo
 	a.netMu.RUnlock()
 	notes, _ := recentAnnotations(r.Context(), a.db, 8)
-	a.render(w, "settings.html", map[string]any{"Profile": profile, "AssetTargets": assetTargets, "CSRF": s.CSRF, "Saved": r.URL.Query().Get("saved") != "", "Cleared": r.URL.Query().Get("cleared") != "", "PiHoleHealth": a.piHoleHealthView(s.CSRF), "TeltonikaHealth": a.teltonikaHealthView(s.CSRF), "Net": info, "Annotations": notes})
+	a.render(w, "settings.html", map[string]any{"Profile": profile, "AssetTargets": assetTargets, "CSRF": s.CSRF, "Saved": r.URL.Query().Get("saved") != "", "Cleared": r.URL.Query().Get("cleared") != "", "PiHoleHealth": a.piHoleHealthView(s.CSRF), "TeltonikaHealth": a.teltonikaHealthView(s.CSRF), "SMTPHealth": a.smtpHealthView(s.CSRF), "Net": info, "Annotations": notes})
 }
 
 func (a *App) clearData(w http.ResponseWriter, r *http.Request) {
@@ -780,6 +781,54 @@ func (a *App) checkTeltonikaHealth(w http.ResponseWriter, r *http.Request) {
 	a.teltonikaHealth = status
 	a.teltonikaHealthMu.Unlock()
 	a.render(w, "teltonika-api-health-content.html", a.teltonikaHealthViewForStatus(s.CSRF, status))
+}
+
+func (a *App) smtpHealthView(csrf string) piHoleHealthView {
+	view := piHoleHealthView{CSRF: csrf}
+	if !a.cfg.smtpEnabled() {
+		view.State, view.Severity, view.Message = "Not configured", "warning", "Set SMTP_HOST and SMTP_TO, then restart Stormwarden."
+		return view
+	}
+	a.smtpHealthMu.RLock()
+	status := a.smtpHealth
+	a.smtpHealthMu.RUnlock()
+	return a.smtpHealthViewForStatus(csrf, status)
+}
+
+func (a *App) smtpHealthViewForStatus(csrf string, status piHoleHealthStatus) piHoleHealthView {
+	view := piHoleHealthView{Configured: true, CSRF: csrf}
+	view.CheckedAt, view.HasChecked = status.CheckedAt, !status.CheckedAt.IsZero()
+	switch status.State {
+	case "healthy":
+		view.State, view.Severity, view.Message = "Sent", "info", status.Message
+	case "failed":
+		view.State, view.Severity, view.Message = "Failed", "error", status.Message
+	default:
+		view.State, view.Severity, view.Message = "Not checked", "info", "Send a test email to the configured recipients."
+	}
+	return view
+}
+
+func (a *App) checkSMTPHealth(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	if err := r.ParseForm(); err != nil || !a.validCSRF(r) {
+		http.Error(w, "invalid request", http.StatusForbidden)
+		return
+	}
+	s := r.Context().Value(sessionContextKey).(session)
+	if !a.cfg.smtpEnabled() {
+		a.render(w, "smtp-health-content.html", a.smtpHealthView(s.CSRF))
+		return
+	}
+	err := a.sendTestMail()
+	status := piHoleHealthStatus{State: "healthy", Message: "Test email accepted.", CheckedAt: time.Now()}
+	if err != nil {
+		status.State, status.Message = "failed", "SMTP test failed: "+redactSMTPErr(err, a.cfg.SMTPPassword)
+	}
+	a.smtpHealthMu.Lock()
+	a.smtpHealth = status
+	a.smtpHealthMu.Unlock()
+	a.render(w, "smtp-health-content.html", a.smtpHealthViewForStatus(s.CSRF, status))
 }
 
 func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) {

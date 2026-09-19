@@ -47,6 +47,8 @@ type App struct {
 	baseline           *Baseline
 	mailMu             sync.Mutex
 	sendMail           func(subject, body string) error
+	smtpHealthMu       sync.RWMutex
+	smtpHealth         piHoleHealthStatus
 	modemMu            sync.Mutex
 	teltonika          *teltonikaClient
 	lastModemAttempt   time.Time

@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -203,6 +206,71 @@ func TestLoadConfigSMTP(t *testing.T) {
 	t.Setenv("SMTP_PORT", "65536")
 	if _, err := LoadConfig(); err == nil {
 		t.Fatal("bad SMTP_PORT accepted")
+	}
+}
+
+func TestSMTPHealthUnconfigured(t *testing.T) {
+	a := newTestApp(t)
+	cookie := login(t, a)
+	request := httptest.NewRequest(http.MethodGet, "/ui/settings", nil)
+	request.AddCookie(cookie)
+	result := httptest.NewRecorder()
+	a.Handler().ServeHTTP(result, request)
+	body := result.Body.String()
+	if result.Code != http.StatusOK || !strings.Contains(body, ">SMTP<") || !strings.Contains(body, "SMTP_HOST") || !strings.Contains(body, "hx-post=\"/ui/smtp-health\"") || !strings.Contains(body, "disabled") {
+		t.Fatalf("unconfigured smtp health status=%d body=%s", result.Code, body)
+	}
+}
+
+func TestSMTPHealthRequiresCSRF(t *testing.T) {
+	a := newTestApp(t)
+	a.cfg.SMTPHost, a.cfg.SMTPTo = "smtp.example", "ops@example"
+	cookie := login(t, a)
+	request := httptest.NewRequest(http.MethodPost, "/ui/smtp-health", nil)
+	request.AddCookie(cookie)
+	result := httptest.NewRecorder()
+	a.Handler().ServeHTTP(result, request)
+	if result.Code != http.StatusForbidden {
+		t.Fatalf("CSRF status=%d", result.Code)
+	}
+}
+
+func TestSMTPHealthSendAndRedact(t *testing.T) {
+	a := newTestApp(t)
+	ctx := context.Background()
+	a.cfg.SMTPHost, a.cfg.SMTPTo, a.cfg.SMTPPassword = "smtp.example", "ops@example", "Secret1a"
+	var gotSubject, gotBody string
+	a.sendMail = func(subject, body string) error {
+		gotSubject, gotBody = subject, body
+		return nil
+	}
+	cookie := login(t, a)
+	s, _ := a.sessions.get(cookie.Value)
+	form := url.Values{"csrf": {s.CSRF}}
+	request := httptest.NewRequest(http.MethodPost, "/ui/smtp-health", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	result := httptest.NewRecorder()
+	a.Handler().ServeHTTP(result, request)
+	body := result.Body.String()
+	if result.Code != http.StatusOK || !strings.Contains(body, ">Sent<") || !strings.Contains(body, "Test email accepted") || gotSubject != "[stormwarden] test email" || !strings.Contains(gotBody, "SMTP test") {
+		t.Fatalf("send status=%d body=%s subject=%q mail=%q", result.Code, body, gotSubject, gotBody)
+	}
+	state, err := loadMailState(ctx, a.db)
+	if err != nil || len(state.Issues) != 0 {
+		t.Fatalf("cadence mutated: %+v err=%v", state, err)
+	}
+	a.sendMail = func(subject, body string) error {
+		return errors.New("535 auth failed Secret1a")
+	}
+	fail := httptest.NewRequest(http.MethodPost, "/ui/smtp-health", strings.NewReader(form.Encode()))
+	fail.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	fail.AddCookie(cookie)
+	failResult := httptest.NewRecorder()
+	a.Handler().ServeHTTP(failResult, fail)
+	failBody := failResult.Body.String()
+	if failResult.Code != http.StatusOK || !strings.Contains(failBody, ">Failed<") || strings.Contains(failBody, "Secret1a") || !strings.Contains(failBody, "***") {
+		t.Fatalf("fail status=%d body=%s", failResult.Code, failBody)
 	}
 }
 
