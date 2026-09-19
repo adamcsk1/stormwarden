@@ -16,37 +16,46 @@ type TCPControl struct {
 }
 
 type Config struct {
-	ListenAddr         string
-	Password           string
-	DataPath           string
-	ExportDir          string
-	PiHoleAddr         string
-	PiHoleAPIURL       string
-	PiHoleAPIPassword  string
-	PublicDNS          string
-	DoHURL             string
-	AssetTargets       string
-	HTTPURL            string
-	HTTPDNSAddr        string
-	TransferURL        string
-	HTTPExpectedStatus int
-	Timezone           *time.Location
-	CookieSecure       bool
-	PingEnabled        bool
-	PingPiholeAddr     string
-	GatewayAddr        string
-	ISPHopAddr         string
-	ISPHopAuto         bool
-	PingInternetAddr   string
-	BurstCount         int
-	BurstInterval      time.Duration
-	BurstCooldown      time.Duration
-	BurstTimeout       time.Duration
-	TCPControls        []TCPControl
-	TracerouteEnabled  bool
-	TracerouteMaxHops  int
-	TracerouteCooldown time.Duration
-	NICStatsEnabled    bool
+	ListenAddr             string
+	Password               string
+	DataPath               string
+	ExportDir              string
+	PiHoleAddr             string
+	PiHoleAPIURL           string
+	PiHoleAPIPassword      string
+	PublicDNS              string
+	DoHURL                 string
+	AssetTargets           string
+	HTTPURL                string
+	HTTPDNSAddr            string
+	TransferURL            string
+	HTTPExpectedStatus     int
+	Timezone               *time.Location
+	CookieSecure           bool
+	PingEnabled            bool
+	PingPiholeAddr         string
+	GatewayAddr            string
+	ISPHopAddr             string
+	ISPHopAuto             bool
+	PingInternetAddr       string
+	BurstCount             int
+	BurstInterval          time.Duration
+	BurstCooldown          time.Duration
+	BurstTimeout           time.Duration
+	TCPControls            []TCPControl
+	TracerouteEnabled      bool
+	TracerouteMaxHops      int
+	TracerouteCooldown     time.Duration
+	NICStatsEnabled        bool
+	SMTPHost               string
+	SMTPPort               int
+	SMTPUser               string
+	SMTPPassword           string
+	SMTPFrom               string
+	SMTPTo                 string
+	SMTPStartTLS           bool
+	SMTPSSL                bool
+	SMTPInsecureSkipVerify bool
 }
 
 var defaultTCPControls = []TCPControl{
@@ -139,38 +148,71 @@ func LoadConfig() (Config, error) {
 	if err != nil {
 		return Config{}, errors.New("TRACEROUTE_COOLDOWN must be a duration")
 	}
+	smtpHost := strings.TrimSpace(os.Getenv("SMTP_HOST"))
+	smtpTo := strings.TrimSpace(os.Getenv("SMTP_TO"))
+	if (smtpHost == "") != (smtpTo == "") {
+		return Config{}, errors.New("SMTP_HOST and SMTP_TO must be set together")
+	}
+	if smtpTo != "" && len(smtpRecipients(smtpTo)) == 0 {
+		return Config{}, errors.New("SMTP_TO must list at least one recipient")
+	}
+	smtpPort, err := envInt("SMTP_PORT", 587)
+	if err != nil || smtpPort < 1 || smtpPort > 65535 {
+		return Config{}, errors.New("SMTP_PORT must be between 1 and 65535")
+	}
+	smtpStartTLS, err := envBool("SMTP_STARTTLS", true)
+	if err != nil {
+		return Config{}, err
+	}
+	smtpSSL, err := envBool("SMTP_SSL", false)
+	if err != nil {
+		return Config{}, err
+	}
+	smtpInsecure, err := envBool("SMTP_INSECURESKIPVERIFY", false)
+	if err != nil {
+		return Config{}, err
+	}
 	return Config{
-		ListenAddr:         env("APP_LISTEN_ADDR", ":8080"),
-		Password:           password,
-		DataPath:           env("DATA_PATH", "data/stormwarden.db"),
-		ExportDir:          env("EXPORT_DIR", "data/exports"),
-		PiHoleAddr:         piholeAddr,
-		PiHoleAPIURL:       piholeAPIURL,
-		PiHoleAPIPassword:  piholeAPIPassword,
-		PublicDNS:          env("PUBLIC_DNS_ADDR", "1.1.1.1:53"),
-		DoHURL:             env("DOH_PROBE_URL", "https://1.1.1.1/dns-query"),
-		AssetTargets:       assetTargets,
-		HTTPURL:            env("HTTP_PROBE_URL", "https://www.google.com/generate_204"),
-		HTTPDNSAddr:        env("HTTP_DNS_ADDR", piholeAddr),
-		TransferURL:        env("TRANSFER_PROBE_URL", "https://speed.cloudflare.com/__down?bytes=262144"),
-		HTTPExpectedStatus: expectedStatus,
-		Timezone:           location,
-		CookieSecure:       secure,
-		PingEnabled:        pingEnabled,
-		PingPiholeAddr:     env("PING_PIHOLE_ADDR", hostOnly(piholeAddr)),
-		GatewayAddr:        os.Getenv("GATEWAY_ADDR"),
-		ISPHopAddr:         os.Getenv("ISP_HOP_ADDR"),
-		ISPHopAuto:         ispAuto,
-		PingInternetAddr:   env("PING_INTERNET_ADDR", "1.1.1.1"),
-		BurstCount:         burstCount,
-		BurstInterval:      time.Duration(burstIntervalMS) * time.Millisecond,
-		BurstCooldown:      burstCooldown,
-		BurstTimeout:       burstTimeout,
-		TCPControls:        controls,
-		TracerouteEnabled:  traceEnabled,
-		TracerouteMaxHops:  traceHops,
-		TracerouteCooldown: traceCooldown,
-		NICStatsEnabled:    nicEnabled,
+		ListenAddr:             env("APP_LISTEN_ADDR", ":8080"),
+		Password:               password,
+		DataPath:               env("DATA_PATH", "data/stormwarden.db"),
+		ExportDir:              env("EXPORT_DIR", "data/exports"),
+		PiHoleAddr:             piholeAddr,
+		PiHoleAPIURL:           piholeAPIURL,
+		PiHoleAPIPassword:      piholeAPIPassword,
+		PublicDNS:              env("PUBLIC_DNS_ADDR", "1.1.1.1:53"),
+		DoHURL:                 env("DOH_PROBE_URL", "https://1.1.1.1/dns-query"),
+		AssetTargets:           assetTargets,
+		HTTPURL:                env("HTTP_PROBE_URL", "https://www.google.com/generate_204"),
+		HTTPDNSAddr:            env("HTTP_DNS_ADDR", piholeAddr),
+		TransferURL:            env("TRANSFER_PROBE_URL", "https://speed.cloudflare.com/__down?bytes=262144"),
+		HTTPExpectedStatus:     expectedStatus,
+		Timezone:               location,
+		CookieSecure:           secure,
+		PingEnabled:            pingEnabled,
+		PingPiholeAddr:         env("PING_PIHOLE_ADDR", hostOnly(piholeAddr)),
+		GatewayAddr:            os.Getenv("GATEWAY_ADDR"),
+		ISPHopAddr:             os.Getenv("ISP_HOP_ADDR"),
+		ISPHopAuto:             ispAuto,
+		PingInternetAddr:       env("PING_INTERNET_ADDR", "1.1.1.1"),
+		BurstCount:             burstCount,
+		BurstInterval:          time.Duration(burstIntervalMS) * time.Millisecond,
+		BurstCooldown:          burstCooldown,
+		BurstTimeout:           burstTimeout,
+		TCPControls:            controls,
+		TracerouteEnabled:      traceEnabled,
+		TracerouteMaxHops:      traceHops,
+		TracerouteCooldown:     traceCooldown,
+		NICStatsEnabled:        nicEnabled,
+		SMTPHost:               smtpHost,
+		SMTPPort:               smtpPort,
+		SMTPUser:               os.Getenv("SMTP_USER"),
+		SMTPPassword:           os.Getenv("SMTP_PASSWORD"),
+		SMTPFrom:               strings.TrimSpace(os.Getenv("SMTP_FROM")),
+		SMTPTo:                 smtpTo,
+		SMTPStartTLS:           smtpStartTLS,
+		SMTPSSL:                smtpSSL,
+		SMTPInsecureSkipVerify: smtpInsecure,
 	}, nil
 }
 

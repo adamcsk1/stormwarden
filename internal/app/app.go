@@ -45,6 +45,8 @@ type App struct {
 	ispHop             string
 	baseMu             sync.Mutex
 	baseline           *Baseline
+	mailMu             sync.Mutex
+	sendMail           func(subject, body string) error
 }
 
 type probeFunc struct {
@@ -739,6 +741,7 @@ func (a *App) updateIncidents(ctx context.Context, issues []Sample, observed map
 			a.logger.Error("incident update failed", "category", category, "error", err)
 		}
 	}
+	a.queueMail()
 }
 
 func worstTCP(samples []Sample) (Sample, bool, bool) {
