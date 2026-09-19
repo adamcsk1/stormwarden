@@ -4,4 +4,4 @@
 <article class="dns-path"><span>SINR</span><strong>{{.SINR}}</strong><small>24h {{.MinSINR}} … {{.MaxSINR}}</small></article>
 <article class="dns-path"><span>RSSI</span><strong>{{.RSSI}}</strong></article>
 </div>
-<p class="muted layer-net">{{if .Sample.NetworkType}}{{.Sample.NetworkType}}{{end}}{{if .Sample.Operator}} · {{.Sample.Operator}}{{end}}{{if .Sample.Band}} · band {{.Sample.Band}}{{end}}{{if gt .Sample.CACount 0}} · CA {{.Sample.CACount}}{{if .Sample.CABands}} ({{.Sample.CABands}}){{end}}{{end}}{{if .Sample.CellID}} · {{.Sample.CellID}}{{end}} · {{localTime .Sample.CreatedAt}} · {{.Samples24}} samples/24h</p>{{end}}{{end}}
+<p class="muted layer-net">{{if .Grade}}<span class="badge {{.GradeSeverity}}">{{.Grade}}</span> {{end}}{{if .Sample.NetworkType}}{{.Sample.NetworkType}}{{end}}{{if .Sample.Operator}} · {{.Sample.Operator}}{{end}}{{if .Sample.Band}} · band {{.Sample.Band}}{{end}}{{if gt .Sample.CACount 0}} · CA {{.Sample.CACount}}{{if .Sample.CABands}} ({{.Sample.CABands}}){{end}}{{end}}{{if .Sample.CellID}} · {{.Sample.CellID}}{{end}} · {{localTime .Sample.CreatedAt}} · {{.Samples24}} samples/24h</p>{{end}}{{end}}

@@ -148,6 +148,7 @@ Mail is sent for **error** and **critical** incidents in:
 - `external_dns`
 - `dns_resolution_failure`
 - `local_dns`
+- `radio_poor` (Teltonika 4G/5G Poor: RSRQ ≤ -20 dB, SINR ≤ 0 dB, or RSRP < -100 dBm; two 5-minute samples)
 
 Warnings, gateway ICMP, single-path DNS, assets, HTTP/TLS remote, and probe-health events are not mailed.
 

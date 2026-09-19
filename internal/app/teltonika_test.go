@@ -102,6 +102,53 @@ func TestLoadConfigTeltonika(t *testing.T) {
 	}
 }
 
+func TestRadioGradeTeltonikaTable(t *testing.T) {
+	rsrq := -21.0
+	if radioGrade(ModemSample{RSRQ: &rsrq}) != "poor" {
+		t.Fatal("rsrq -21")
+	}
+	rsrp := -101.0
+	if radioGrade(ModemSample{RSRP: &rsrp}) != "poor" {
+		t.Fatal("rsrp -101")
+	}
+	sinr := 0.0
+	if radioGrade(ModemSample{SINR: &sinr}) != "poor" {
+		t.Fatal("sinr 0")
+	}
+	good := -12.0
+	if radioGrade(ModemSample{RSRQ: &good}) != "good" {
+		t.Fatal("rsrq -12")
+	}
+	if radioGrade(ModemSample{}) != "" {
+		t.Fatal("empty graded")
+	}
+}
+
+func TestRadioPoorIncidentAfterTwoSamples(t *testing.T) {
+	a := newTestApp(t)
+	ctx := context.Background()
+	rsrq := -22.0
+	s := ModemSample{CreatedAt: time.Now(), RSRQ: &rsrq}
+	a.updateRadioIncident(ctx, s)
+	inc, err := activeIncident(ctx, a.db)
+	if err != nil || inc != nil {
+		t.Fatalf("first poor opened: %+v", inc)
+	}
+	a.updateRadioIncident(ctx, s)
+	inc, err = activeIncident(ctx, a.db)
+	if err != nil || inc == nil || inc.Category != "radio_poor" || inc.Severity != Error {
+		t.Fatalf("second poor: %+v err=%v", inc, err)
+	}
+	good := -8.0
+	a.updateRadioIncident(ctx, ModemSample{CreatedAt: time.Now(), RSRQ: &good})
+	a.updateRadioIncident(ctx, ModemSample{CreatedAt: time.Now(), RSRQ: &good})
+	a.updateRadioIncident(ctx, ModemSample{CreatedAt: time.Now(), RSRQ: &good})
+	inc, err = activeIncident(ctx, a.db)
+	if err != nil || inc != nil {
+		t.Fatalf("recovered still open: %+v", inc)
+	}
+}
+
 func TestParseModemStatsDoesNotTreatB30AsB3(t *testing.T) {
 	var data any
 	_ = json.Unmarshal([]byte(`{"band":"B3","ca":{"scc":[{"band":"B30"}]}}`), &data)
