@@ -110,6 +110,40 @@ docker compose exec stormwarden stormwarden annotate "Disabled Omada IDS/IPS"
 | `APP_COOKIE_SECURE` | `false` | Require HTTPS session cookies |
 | `DATA_PATH` | `/data/stormwarden.db` | SQLite location in image |
 | `EXPORT_DIR` | `/data/exports` | Generated reports |
+| `SMTP_HOST` | empty (off) | SMTP server. Set with `SMTP_TO` to enable mail |
+| `SMTP_PORT` | `587` | SMTP port |
+| `SMTP_USER` | | SMTP login |
+| `SMTP_PASSWORD` | | SMTP password |
+| `SMTP_FROM` | | From address (falls back to user / first To) |
+| `SMTP_TO` | | Recipient(s), comma-separated |
+| `SMTP_STARTTLS` | `1` | STARTTLS on 587 |
+| `SMTP_SSL` | `0` | SMTPS (port 465); set `SMTP_STARTTLS=0` with this |
+| `SMTP_INSECURESKIPVERIFY` | `false` | Skip TLS cert verify (self-signed SMTP) |
+
+## Email alerts
+
+Optional. Set `SMTP_HOST` and `SMTP_TO` (same names as elprotector). Empty = no mail.
+
+Mail is sent for **error** and **critical** incidents in:
+
+- `internet_outage`
+- `wan_or_isp_packet_loss`
+- `host_or_nic`
+- `local_network_or_host`
+- `external_dns`
+- `dns_resolution_failure`
+- `local_dns`
+
+Warnings, gateway ICMP, single-path DNS, assets, HTTP/TLS remote, and probe-health events are not mailed.
+
+Per category, not per poll (same cadence as elprotector):
+
+1. First opened
+2. Still open 8 hours after first seen
+3. Still open 4 hours after that
+4. Then once a day until it is gone
+
+Gone → cadence resets. No all-clear mail. A failed SMTP send does not advance the counter and does not stop probing. Failed attempts wait 15 minutes before retry. SMTP runs in the background with a 30s timeout so a dead WAN cannot stall health checks.
 
 ## Probe hierarchy and classification
 
