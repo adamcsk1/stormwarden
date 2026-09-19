@@ -1,0 +1,7 @@
+{{define "modem.html"}}{{if not .Configured}}<p class="muted">Teltonika not configured.</p>{{else if not .Sample}}<p class="muted">Waiting for first modem poll.</p>{{else}}<div class="dns-path-grid">
+<article class="dns-path"><span>RSRP</span><strong>{{.RSRP}}</strong><small>24h {{.MinRSRP}} … {{.MaxRSRP}}</small></article>
+<article class="dns-path"><span>RSRQ</span><strong>{{.RSRQ}}</strong></article>
+<article class="dns-path"><span>SINR</span><strong>{{.SINR}}</strong><small>24h {{.MinSINR}} … {{.MaxSINR}}</small></article>
+<article class="dns-path"><span>RSSI</span><strong>{{.RSSI}}</strong></article>
+</div>
+<p class="muted layer-net">{{if .Sample.NetworkType}}{{.Sample.NetworkType}}{{end}}{{if .Sample.Operator}} · {{.Sample.Operator}}{{end}}{{if .Sample.Band}} · band {{.Sample.Band}}{{end}}{{if gt .Sample.CACount 0}} · CA {{.Sample.CACount}}{{if .Sample.CABands}} ({{.Sample.CABands}}){{end}}{{end}}{{if .Sample.CellID}} · {{.Sample.CellID}}{{end}} · {{localTime .Sample.CreatedAt}} · {{.Samples24}} samples/24h</p>{{end}}{{end}}

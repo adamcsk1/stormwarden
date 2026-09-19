@@ -129,6 +129,11 @@ docker compose exec stormwarden stormwarden annotate "Disabled Omada IDS/IPS"
 | `SMTP_STARTTLS` | `1` | STARTTLS on 587 |
 | `SMTP_SSL` | `0` | SMTPS (port 465); set `SMTP_STARTTLS=0` with this |
 | `SMTP_INSECURESKIPVERIFY` | `false` | Skip TLS cert verify (self-signed SMTP) |
+| `TELTONIKA_URL` | empty (off) | Router WebUI origin, e.g. `https://192.168.1.1` |
+| `TELTONIKA_USER` | `admin` | WebUI user. Prefer a read-only `user`-group account |
+| `TELTONIKA_PASSWORD` | | WebUI password (required with URL) |
+| `TELTONIKA_ALLOW_INSECURE_HTTP` | `false` | Allow `http://` on a trusted LAN |
+| `TELTONIKA_INSECURESKIPVERIFY` | `false` | Skip TLS cert verify (self-signed HTTPS) |
 
 ## Email alerts
 
@@ -154,6 +159,40 @@ Per category, not per poll (same cadence as elprotector):
 4. Then once a day until it is gone
 
 Gone → cadence resets. No all-clear mail. A failed SMTP send does not advance the counter and does not stop probing. Failed attempts wait 15 minutes before retry. SMTP runs in the background with a 30s timeout so a dead WAN cannot stall health checks.
+
+## Teltonika mobile radio
+
+Optional. Stormwarden polls RutOS JSON-RPC (`POST /ubus`) every 5 minutes for RSSI, RSRP, RSRQ, SINR, band, cell, operator, and carrier aggregation. Opening a WAN/DNS incident also fetches once, unless a poll already ran in that 5-minute window. Cached `gsm.modem*` stats only — no `gsmctl` / extra AT commands. One in-flight request, 5s timeout. Failures are logged and never change probe severity.
+
+Self-signed HTTPS:
+
+```
+TELTONIKA_URL=https://192.168.1.1
+TELTONIKA_USER=stormwarden
+TELTONIKA_PASSWORD=...
+TELTONIKA_INSECURESKIPVERIFY=true
+```
+
+### Read-only WebUI user
+
+Do not use `admin` / `root`. On the router:
+
+1. **System → Administration → User Settings → System Users**
+2. Add a user, group **`user`**. No SSH.
+3. Edit the **`user`** group:
+   - **Hide sensitive information:** on
+   - **Write action:** Deny
+   - **Read action:** Allow
+   - **Read access** (paths after `#` in the WebUI URL):
+
+| Path | Page |
+| --- | --- |
+| `status/network` | **Status → Network** (Mobile: RSSI, RSRP, RSRQ, SINR, CA, cell) |
+| `status/overview` | **Status → Overview** (login landing; needed so the user can open WebUI) |
+
+If a path 404s in group settings, open that page as admin and copy the URL starting at `#`. Example: `https://192.168.1.1/#/status/network` → `status/network`.
+
+Default `user` cannot read Network. Without `status/network`, JSON-RPC radio calls are denied.
 
 ## Probe hierarchy and classification
 
@@ -226,6 +265,5 @@ go run ./cmd/stormwarden
 
 ## Current Limits
 
-- No modem/router radio metrics yet. Weather or 4G/5G signal causation needs RSRP, RSRQ, SINR, band, and cell data from a router API.
 - ICMP and traceroute need `NET_RAW`. Set `GATEWAY_ADDR` when running on the Docker bridge.
 - In-memory sessions expire on application restart, requiring login again.
