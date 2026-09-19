@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"embed"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"html/template"
 	"io/fs"
@@ -154,12 +156,14 @@ func (a *App) routes() http.Handler {
 	mux.Handle("GET /ui/incidents", a.requireAuth(http.HandlerFunc(a.incidentsFragment)))
 	mux.Handle("GET /ui/incidents/{id}", a.requireAuth(http.HandlerFunc(a.incidentDetailFragment)))
 	mux.Handle("GET /ui/layers", a.requireAuth(http.HandlerFunc(a.layersFragment)))
+	mux.Handle("GET /ui/modem", a.requireAuth(http.HandlerFunc(a.modemFragment)))
 	mux.Handle("GET /ui/compare", a.requireAuth(http.HandlerFunc(a.compareFragment)))
 	mux.Handle("POST /ui/annotations", a.requireAuth(http.HandlerFunc(a.createAnnotation)))
 	mux.Handle("GET /ui/settings", a.requireAuth(http.HandlerFunc(a.settingsFragment)))
 	mux.Handle("POST /ui/settings", a.requireAuth(http.HandlerFunc(a.saveSettings)))
 	mux.Handle("POST /ui/clear-data", a.requireAuth(http.HandlerFunc(a.clearData)))
 	mux.Handle("POST /ui/pihole-api-health", a.requireAuth(http.HandlerFunc(a.checkPiHoleAPIHealth)))
+	mux.Handle("POST /ui/teltonika-health", a.requireAuth(http.HandlerFunc(a.checkTeltonikaHealth)))
 	mux.Handle("GET /ui/exports", a.requireAuth(http.HandlerFunc(a.exportsFragment)))
 	mux.Handle("POST /ui/exports", a.requireAuth(http.HandlerFunc(a.createExport)))
 	mux.Handle("POST /ui/exports/{id}/delete", a.requireAuth(http.HandlerFunc(a.deleteExport)))
@@ -279,7 +283,7 @@ func (a *App) validCSRF(r *http.Request) bool {
 
 func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 	s := r.Context().Value(sessionContextKey).(session)
-	a.render(w, "dashboard.html", map[string]any{"CSRF": s.CSRF})
+	a.render(w, "dashboard.html", map[string]any{"CSRF": s.CSRF, "Modem": a.cfg.teltonikaEnabled()})
 }
 
 func (a *App) summaryFragment(w http.ResponseWriter, r *http.Request) {
@@ -502,6 +506,51 @@ func (a *App) layersFragment(w http.ResponseWriter, r *http.Request) {
 	a.render(w, "layers.html", map[string]any{"Layers": layers, "Net": info})
 }
 
+func radioText(v *float64, unit string, prec int) string {
+	if v == nil {
+		return "—"
+	}
+	return strconv.FormatFloat(*v, 'f', prec, 64) + " " + unit
+}
+
+func nullRadio(n sql.NullFloat64, unit string, prec int) string {
+	if !n.Valid {
+		return "—"
+	}
+	v := n.Float64
+	return radioText(&v, unit, prec)
+}
+
+func (a *App) modemFragment(w http.ResponseWriter, r *http.Request) {
+	if !a.cfg.teltonikaEnabled() {
+		a.render(w, "modem.html", map[string]any{"Configured": false})
+		return
+	}
+	sample, err := latestModemSample(r.Context(), a.db)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	stats, err := modemStatsSince(r.Context(), a.db, time.Now().Add(-24*time.Hour))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	view := map[string]any{"Configured": true, "Samples24": stats.Samples}
+	if sample != nil {
+		view["Sample"] = sample
+		view["RSSI"] = radioText(sample.RSSI, "dBm", 0)
+		view["RSRP"] = radioText(sample.RSRP, "dBm", 0)
+		view["RSRQ"] = radioText(sample.RSRQ, "dB", 0)
+		view["SINR"] = radioText(sample.SINR, "dB", 1)
+		view["MinRSRP"] = nullRadio(stats.MinRSRP, "dBm", 0)
+		view["MaxRSRP"] = nullRadio(stats.MaxRSRP, "dBm", 0)
+		view["MinSINR"] = nullRadio(stats.MinSINR, "dB", 1)
+		view["MaxSINR"] = nullRadio(stats.MaxSINR, "dB", 1)
+	}
+	a.render(w, "modem.html", view)
+}
+
 func (a *App) compareFragment(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	rangeName := r.URL.Query().Get("range")
@@ -544,7 +593,7 @@ func (a *App) settingsFragment(w http.ResponseWriter, r *http.Request) {
 	info := a.netInfo
 	a.netMu.RUnlock()
 	notes, _ := recentAnnotations(r.Context(), a.db, 8)
-	a.render(w, "settings.html", map[string]any{"Profile": profile, "AssetTargets": assetTargets, "CSRF": s.CSRF, "Saved": r.URL.Query().Get("saved") != "", "Cleared": r.URL.Query().Get("cleared") != "", "PiHoleHealth": a.piHoleHealthView(s.CSRF), "Net": info, "Annotations": notes})
+	a.render(w, "settings.html", map[string]any{"Profile": profile, "AssetTargets": assetTargets, "CSRF": s.CSRF, "Saved": r.URL.Query().Get("saved") != "", "Cleared": r.URL.Query().Get("cleared") != "", "PiHoleHealth": a.piHoleHealthView(s.CSRF), "TeltonikaHealth": a.teltonikaHealthView(s.CSRF), "Net": info, "Annotations": notes})
 }
 
 func (a *App) clearData(w http.ResponseWriter, r *http.Request) {
@@ -649,6 +698,83 @@ func (a *App) checkPiHoleAPIHealth(w http.ResponseWriter, r *http.Request) {
 	close(check.done)
 	a.piholeHealthMu.Unlock()
 	a.render(w, "pihole-api-health-content.html", a.piHoleHealthViewForStatus(s.CSRF, status))
+}
+
+func (a *App) teltonikaHealthView(csrf string) piHoleHealthView {
+	view := piHoleHealthView{CSRF: csrf}
+	if a.teltonika == nil {
+		view.State, view.Severity, view.Message = "Not configured", "warning", "Set TELTONIKA_URL and TELTONIKA_PASSWORD, then restart Stormwarden."
+		return view
+	}
+	a.teltonikaHealthMu.RLock()
+	status := a.teltonikaHealth
+	a.teltonikaHealthMu.RUnlock()
+	return a.teltonikaHealthViewForStatus(csrf, status)
+}
+
+func (a *App) teltonikaHealthViewForStatus(csrf string, status piHoleHealthStatus) piHoleHealthView {
+	view := piHoleHealthView{Configured: true, CSRF: csrf}
+	view.CheckedAt, view.HasChecked = status.CheckedAt, !status.CheckedAt.IsZero()
+	switch status.State {
+	case "checking":
+		view.Checking = true
+		view.State, view.Severity, view.Message = "Checking", "warning", "Contacting Teltonika..."
+	case "healthy":
+		view.State, view.Severity, view.Message = "Healthy", "info", status.Message
+	case "failed":
+		view.State, view.Severity, view.Message = "Failed", "error", status.Message
+	default:
+		view.State, view.Severity, view.Message = "Not checked", "info", "Run a manual check to verify WebUI login and radio stats."
+	}
+	return view
+}
+
+func (a *App) runTeltonikaHealth(ctx context.Context) (string, error) {
+	if a.teltonika == nil {
+		return "", errors.New("not configured")
+	}
+	a.modemMu.Lock()
+	defer a.modemMu.Unlock()
+	a.lastModemAttempt = time.Now()
+	pollCtx, cancel := context.WithTimeout(ctx, teltonikaHTTPTimeout)
+	defer cancel()
+	sample, err := a.teltonika.fetch(pollCtx)
+	if err != nil {
+		return "", err
+	}
+	sample.CreatedAt = time.Now()
+	if err := insertModemSample(ctx, a.db, sample); err != nil {
+		return "", err
+	}
+	line := sample.evidenceLine()
+	if line == "" {
+		return "Teltonika login ok; no radio metrics yet", nil
+	}
+	return line, nil
+}
+
+func (a *App) checkTeltonikaHealth(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	if err := r.ParseForm(); err != nil || !a.validCSRF(r) {
+		http.Error(w, "invalid request", http.StatusForbidden)
+		return
+	}
+	s := r.Context().Value(sessionContextKey).(session)
+	if a.teltonika == nil {
+		a.render(w, "teltonika-api-health-content.html", a.teltonikaHealthView(s.CSRF))
+		return
+	}
+	checkCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	message, err := a.runTeltonikaHealth(checkCtx)
+	status := piHoleHealthStatus{State: "healthy", Message: message, CheckedAt: time.Now()}
+	if err != nil {
+		status.State, status.Message = "failed", "Teltonika check failed: "+redactSMTPErr(err, a.cfg.TeltonikaPassword)
+	}
+	a.teltonikaHealthMu.Lock()
+	a.teltonikaHealth = status
+	a.teltonikaHealthMu.Unlock()
+	a.render(w, "teltonika-api-health-content.html", a.teltonikaHealthViewForStatus(s.CSRF, status))
 }
 
 func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) {

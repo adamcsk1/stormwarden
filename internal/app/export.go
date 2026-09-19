@@ -246,7 +246,7 @@ func (a *App) writeExport(ctx context.Context, zw *zip.Writer, from, to time.Tim
 	if err := zipJSON(zw, "annotations.json", notes); err != nil {
 		return err
 	}
-	settings := map[string]any{"profile": profile, "asset_targets": redactedAssetTargets, "pihole_dns_target": a.cfg.PiHoleAddr, "public_dns_target": a.cfg.PublicDNS, "doh_probe_url": redactURL(a.cfg.DoHURL), "http_dns_target": a.cfg.HTTPDNSAddr, "http_probe_url": redactURL(a.cfg.HTTPURL), "http_expected_status": a.cfg.HTTPExpectedStatus, "transfer_probe_url": redactURL(a.cfg.TransferURL), "tcp_controls": a.cfg.tcpControls(), "gateway_addr": a.cfg.GatewayAddr, "ping_enabled": a.cfg.PingEnabled, "smtp_enabled": a.cfg.smtpEnabled(), "raw_retention_days": 30, "rollup_retention": "indefinite", "export_retention_days": 7}
+	settings := map[string]any{"profile": profile, "asset_targets": redactedAssetTargets, "pihole_dns_target": a.cfg.PiHoleAddr, "public_dns_target": a.cfg.PublicDNS, "doh_probe_url": redactURL(a.cfg.DoHURL), "http_dns_target": a.cfg.HTTPDNSAddr, "http_probe_url": redactURL(a.cfg.HTTPURL), "http_expected_status": a.cfg.HTTPExpectedStatus, "transfer_probe_url": redactURL(a.cfg.TransferURL), "tcp_controls": a.cfg.tcpControls(), "gateway_addr": a.cfg.GatewayAddr, "ping_enabled": a.cfg.PingEnabled, "smtp_enabled": a.cfg.smtpEnabled(), "teltonika_enabled": a.cfg.teltonikaEnabled(), "raw_retention_days": 30, "rollup_retention": "indefinite", "export_retention_days": 7}
 	if err := zipJSON(zw, "settings-redacted.json", settings); err != nil {
 		return err
 	}

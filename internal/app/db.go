@@ -159,6 +159,25 @@ CREATE TABLE IF NOT EXISTS daily_rollups_v2 (
 )`); err != nil {
 		return err
 	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS modem_samples (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL,
+  rssi REAL,
+  rsrp REAL,
+  rsrq REAL,
+  sinr REAL,
+  rscp REAL,
+  ecio REAL,
+  ca_count INTEGER NOT NULL DEFAULT 0,
+  band TEXT NOT NULL DEFAULT '',
+  ca_bands TEXT NOT NULL DEFAULT '',
+  operator TEXT NOT NULL DEFAULT '',
+  network_type TEXT NOT NULL DEFAULT '',
+  cell_id TEXT NOT NULL DEFAULT '',
+  message TEXT NOT NULL DEFAULT ''
+); CREATE INDEX IF NOT EXISTS idx_modem_samples_created ON modem_samples(created_at DESC)`); err != nil {
+		return err
+	}
 	if value, _ := setting(context.Background(), db, "fixed_timestamps_v1"); value != "done" {
 		tx, err := db.Begin()
 		if err != nil {
@@ -652,6 +671,70 @@ func recentAnnotations(ctx context.Context, db *sql.DB, limit int) ([]Annotation
 	return listAnnotations(ctx, db, time.Unix(0, 0), time.Now().Add(time.Minute), limit)
 }
 
+func nullFloat(v *float64) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
+func scanNullFloat(n sql.NullFloat64) *float64 {
+	if !n.Valid {
+		return nil
+	}
+	v := n.Float64
+	return &v
+}
+
+func insertModemSample(ctx context.Context, db *sql.DB, s ModemSample) error {
+	_, err := db.ExecContext(ctx, `INSERT INTO modem_samples(created_at, rssi, rsrp, rsrq, sinr, rscp, ecio, ca_count, band, ca_bands, operator, network_type, cell_id, message)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		dbTime(s.CreatedAt), nullFloat(s.RSSI), nullFloat(s.RSRP), nullFloat(s.RSRQ), nullFloat(s.SINR), nullFloat(s.RSCP), nullFloat(s.EcIo),
+		s.CACount, s.Band, s.CABands, s.Operator, s.NetworkType, s.CellID, s.Message)
+	return err
+}
+
+func latestModemSample(ctx context.Context, db *sql.DB) (*ModemSample, error) {
+	row := db.QueryRowContext(ctx, `SELECT id, created_at, rssi, rsrp, rsrq, sinr, rscp, ecio, ca_count, band, ca_bands, operator, network_type, cell_id, message FROM modem_samples ORDER BY id DESC LIMIT 1`)
+	s, err := scanModemSample(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+type modemDayStats struct {
+	Samples                                                                int
+	MinRSRP, MaxRSRP, MinRSRQ, MaxRSRQ, MinSINR, MaxSINR, MinRSSI, MaxRSSI sql.NullFloat64
+}
+
+func modemStatsSince(ctx context.Context, db *sql.DB, since time.Time) (modemDayStats, error) {
+	var s modemDayStats
+	err := db.QueryRowContext(ctx, `SELECT COUNT(*), MIN(rsrp), MAX(rsrp), MIN(rsrq), MAX(rsrq), MIN(sinr), MAX(sinr), MIN(rssi), MAX(rssi)
+FROM modem_samples WHERE created_at>=?`, dbTime(since)).Scan(&s.Samples, &s.MinRSRP, &s.MaxRSRP, &s.MinRSRQ, &s.MaxRSRQ, &s.MinSINR, &s.MaxSINR, &s.MinRSSI, &s.MaxRSSI)
+	return s, err
+}
+
+type modemRow interface {
+	Scan(dest ...any) error
+}
+
+func scanModemSample(row modemRow) (ModemSample, error) {
+	var s ModemSample
+	var created string
+	var rssi, rsrp, rsrq, sinr, rscp, ecio sql.NullFloat64
+	err := row.Scan(&s.ID, &created, &rssi, &rsrp, &rsrq, &sinr, &rscp, &ecio, &s.CACount, &s.Band, &s.CABands, &s.Operator, &s.NetworkType, &s.CellID, &s.Message)
+	if err != nil {
+		return ModemSample{}, err
+	}
+	s.CreatedAt, _ = parseDBTime(created)
+	s.RSSI, s.RSRP, s.RSRQ, s.SINR, s.RSCP, s.EcIo = scanNullFloat(rssi), scanNullFloat(rsrp), scanNullFloat(rsrq), scanNullFloat(sinr), scanNullFloat(rscp), scanNullFloat(ecio)
+	return s, nil
+}
+
 func clearRecordedData(ctx context.Context, db *sql.DB) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -659,7 +742,7 @@ func clearRecordedData(ctx context.Context, db *sql.DB) error {
 	}
 	defer tx.Rollback()
 	for _, table := range []string{
-		"samples", "incidents",
+		"samples", "incidents", "modem_samples",
 		"quarter_hour_rollups", "hourly_rollups", "daily_rollups",
 		"quarter_hour_rollups_v2", "hourly_rollups_v2", "daily_rollups_v2",
 	} {
@@ -699,6 +782,9 @@ avg_mbps=((avg_mbps*samples)+(excluded.avg_mbps*excluded.samples))/(samples+excl
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM samples WHERE created_at < ?`, cutoff); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM modem_samples WHERE created_at < ?`, cutoff); err != nil {
 		return err
 	}
 	return tx.Commit()

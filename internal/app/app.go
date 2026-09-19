@@ -47,6 +47,11 @@ type App struct {
 	baseline           *Baseline
 	mailMu             sync.Mutex
 	sendMail           func(subject, body string) error
+	modemMu            sync.Mutex
+	teltonika          *teltonikaClient
+	lastModemAttempt   time.Time
+	teltonikaHealthMu  sync.RWMutex
+	teltonikaHealth    piHoleHealthStatus
 }
 
 type probeFunc struct {
@@ -200,6 +205,9 @@ func New(cfg Config, logger *slog.Logger) (*App, error) {
 	if cfg.PiHoleAPIURL != "" {
 		a.piholeAPI = newPiHoleAPIClient(cfg.PiHoleAPIURL, cfg.PiHoleAPIPassword)
 	}
+	if cfg.teltonikaEnabled() {
+		a.teltonika = newTeltonikaClient(cfg)
+	}
 	return a, nil
 }
 
@@ -258,6 +266,7 @@ func (a *App) Start(ctx context.Context) {
 	go a.maintenance(ctx)
 	go a.exportWorker(ctx)
 	go a.discoverLoop(ctx)
+	go a.modemLoop(ctx)
 }
 
 func (a *App) assetScheduler(ctx context.Context) {
@@ -726,6 +735,11 @@ func (a *App) updateIncidents(ctx context.Context, issues []Sample, observed map
 				state.peakIssue = issue
 			}
 			if state.badCycles >= 2 {
+				if wantsModemEvidence(issue) {
+					a.pollModem(ctx)
+				}
+				a.attachModemEvidence(ctx, &issue)
+				a.attachModemEvidence(ctx, &state.peakIssue)
 				if err := openIncidentWithPeak(ctx, a.db, issue, state.peakIssue); err != nil {
 					a.logger.Error("incident creation failed", "category", category, "error", err)
 				}

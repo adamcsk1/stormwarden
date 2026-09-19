@@ -377,7 +377,7 @@ func TestPiHoleSettingsDuringCheckCanJoinResult(t *testing.T) {
 	result := httptest.NewRecorder()
 	a.Handler().ServeHTTP(result, request)
 	body := result.Body.String()
-	if result.Code != http.StatusOK || !strings.Contains(body, ">Wait for result<") || strings.Contains(body, `type="submit" disabled`) {
+	if result.Code != http.StatusOK || !strings.Contains(body, ">Wait for result<") || strings.Contains(body, "disabled>Wait for result") {
 		t.Fatalf("in-flight settings status=%d body=%s", result.Code, body)
 	}
 }
