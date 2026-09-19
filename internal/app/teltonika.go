@@ -19,7 +19,6 @@ import (
 const (
 	teltonikaPollInterval = 5 * time.Minute
 	teltonikaHTTPTimeout  = 5 * time.Second
-	ubusEmptySession      = "00000000000000000000000000000000"
 )
 
 var modemEvidenceCategories = map[string]bool{
@@ -55,7 +54,6 @@ type teltonikaClient struct {
 	mu       sync.Mutex
 	session  string
 	until    time.Time
-	rpcID    int
 }
 
 func (c Config) teltonikaEnabled() bool {
@@ -105,29 +103,38 @@ func (c *teltonikaClient) ensureSession(ctx context.Context) error {
 	if c.session != "" && time.Now().Before(c.until) {
 		return nil
 	}
-	payload, err := c.call(ctx, ubusEmptySession, "session", "login", map[string]any{
-		"username": c.user,
-		"password": c.password,
-	})
+	body, err := json.Marshal(map[string]string{"username": c.user, "password": c.password})
+	if err != nil {
+		return err
+	}
+	raw, err := c.do(ctx, http.MethodPost, "/api/login", body, false)
 	if err != nil {
 		return err
 	}
 	var login struct {
-		Session string `json:"ubus_rpc_session"`
-		Timeout int    `json:"timeout"`
-		Expires int    `json:"expires"`
+		Success bool `json:"success"`
+		Data    struct {
+			Token   string `json:"token"`
+			Expires int    `json:"expires"`
+		} `json:"data"`
+		Errors []struct {
+			Error string `json:"error"`
+		} `json:"errors"`
 	}
-	if err := json.Unmarshal(payload, &login); err != nil || login.Session == "" {
-		return errors.New("teltonika login did not return a session")
+	if err := json.Unmarshal(raw, &login); err != nil {
+		return err
 	}
-	ttl := login.Expires
-	if ttl <= 0 {
-		ttl = login.Timeout
+	if !login.Success || login.Data.Token == "" {
+		if len(login.Errors) > 0 && login.Errors[0].Error != "" {
+			return fmt.Errorf("teltonika login: %s", login.Errors[0].Error)
+		}
+		return errors.New("teltonika login did not return a token")
 	}
+	ttl := login.Data.Expires
 	if ttl <= 0 {
 		ttl = 300
 	}
-	c.session = login.Session
+	c.session = login.Data.Token
 	d := time.Duration(ttl) * time.Second
 	if d > 30*time.Second {
 		d -= 30 * time.Second
@@ -146,60 +153,69 @@ func isTeltonikaAuthErr(err error) bool {
 		return false
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "status 6") || strings.Contains(msg, "HTTP 401") || strings.Contains(msg, "HTTP 403") || strings.Contains(msg, "Access denied")
+	return strings.Contains(msg, "HTTP 401") || strings.Contains(msg, "Access denied") || strings.Contains(msg, "Invalid username")
 }
 
 func (c *teltonikaClient) readStats(ctx context.Context) (ModemSample, error) {
-	var last error
-	for _, object := range []string{"gsm.modem0", "gsm.modem1"} {
-		for _, method := range []string{"get_live_stats", "info", "status"} {
-			if err := ctx.Err(); err != nil {
-				return ModemSample{}, err
-			}
-			payload, err := c.call(ctx, c.session, object, method, map[string]any{})
-			if err != nil {
-				last = err
-				continue
-			}
-			var data any
-			if err := json.Unmarshal(payload, &data); err != nil {
-				last = err
-				continue
-			}
-			sample := parseModemStats(data)
+	raw, err := c.do(ctx, http.MethodGet, "/api/modems/status", nil, true)
+	if err != nil {
+		return ModemSample{}, err
+	}
+	var envelope struct {
+		Success *bool           `json:"success"`
+		Data    json.RawMessage `json:"data"`
+		Errors  []struct {
+			Error string `json:"error"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return ModemSample{}, err
+	}
+	if envelope.Success != nil && !*envelope.Success {
+		if len(envelope.Errors) > 0 && envelope.Errors[0].Error != "" {
+			return ModemSample{}, fmt.Errorf("teltonika api: %s", envelope.Errors[0].Error)
+		}
+		return ModemSample{}, errors.New("teltonika modem stats unavailable")
+	}
+	var data any
+	if err := json.Unmarshal(envelope.Data, &data); err != nil {
+		return ModemSample{}, err
+	}
+	switch items := data.(type) {
+	case []any:
+		var last error
+		for _, item := range items {
+			sample := parseModemStats(item)
 			if sample.hasRadio() {
 				return sample, nil
 			}
 			last = errors.New("teltonika response had no radio metrics")
 		}
+		if last != nil {
+			return ModemSample{}, last
+		}
+	default:
+		sample := parseModemStats(data)
+		if sample.hasRadio() {
+			return sample, nil
+		}
 	}
-	if last == nil {
-		last = errors.New("teltonika modem stats unavailable")
-	}
-	return ModemSample{}, last
+	return ModemSample{}, errors.New("teltonika response had no radio metrics")
 }
 
-type ubusRPCError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-func (c *teltonikaClient) call(ctx context.Context, session, object, method string, args map[string]any) (json.RawMessage, error) {
-	c.rpcID++
-	body, err := json.Marshal(map[string]any{
-		"jsonrpc": "2.0",
-		"id":      c.rpcID,
-		"method":  "call",
-		"params":  []any{session, object, method, args},
-	})
-	if err != nil {
-		return nil, err
+func (c *teltonikaClient) do(ctx context.Context, method, path string, body []byte, auth bool) ([]byte, error) {
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/ubus", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, rdr)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if auth {
+		req.Header.Set("Authorization", "Bearer "+c.session)
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err
@@ -210,33 +226,9 @@ func (c *teltonikaClient) call(ctx context.Context, session, object, method stri
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("teltonika ubus HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("teltonika HTTP %d", resp.StatusCode)
 	}
-	var envelope struct {
-		Error  *ubusRPCError   `json:"error"`
-		Result json.RawMessage `json:"result"`
-	}
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return nil, err
-	}
-	if envelope.Error != nil {
-		return nil, fmt.Errorf("teltonika rpc: %s", envelope.Error.Message)
-	}
-	var parts []json.RawMessage
-	if err := json.Unmarshal(envelope.Result, &parts); err != nil || len(parts) == 0 {
-		return nil, errors.New("teltonika ubus result malformed")
-	}
-	var status int
-	if err := json.Unmarshal(parts[0], &status); err != nil {
-		return nil, err
-	}
-	if status != 0 {
-		return nil, fmt.Errorf("ubus %s.%s status %d", object, method, status)
-	}
-	if len(parts) < 2 {
-		return json.RawMessage(`{}`), nil
-	}
-	return parts[1], nil
+	return raw, nil
 }
 
 func (s ModemSample) hasRadio() bool {
@@ -398,7 +390,7 @@ func joinCABands(v any) string {
 	var bands []string
 	walkJSON(v, 0, func(key string, val any, depth int) bool {
 		lk := strings.ToLower(key)
-		if lk != "scc" && lk != "ca" && lk != "carriers" {
+		if lk != "scc" && lk != "ca" && lk != "carriers" && lk != "ca_signal" {
 			return true
 		}
 		switch items := val.(type) {

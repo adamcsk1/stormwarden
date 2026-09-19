@@ -296,7 +296,7 @@ func redactSMTPErr(err error, password string) string {
 	if password != "" {
 		msg = strings.ReplaceAll(msg, password, "***")
 	}
-	return fmt.Sprintf("%T", err) + " " + msg
+	return msg
 }
 
 func mailHost() string {

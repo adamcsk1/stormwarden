@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -43,30 +42,21 @@ func TestParseModemStatsUnits(t *testing.T) {
 func TestTeltonikaFetchAndReuseSession(t *testing.T) {
 	var logins atomic.Int32
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/ubus" {
-			http.NotFound(w, r)
-			return
-		}
-		raw, _ := io.ReadAll(r.Body)
-		var req struct {
-			Params []any `json:"params"`
-		}
-		_ = json.Unmarshal(raw, &req)
-		method := ""
-		if len(req.Params) > 2 {
-			method, _ = req.Params[2].(string)
-		}
 		w.Header().Set("Content-Type", "application/json")
-		if method == "login" {
+		switch r.URL.Path {
+		case "/api/login":
 			logins.Add(1)
-			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":[0,{"ubus_rpc_session":"sess","timeout":300,"expires":300}]}`))
-			return
+			_, _ = w.Write([]byte(`{"success":true,"data":{"token":"sess","expires":300}}`))
+		case "/api/modems/status":
+			if r.Header.Get("Authorization") != "Bearer sess" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"success":false}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"success":true,"data":[{"rssi":-70,"rsrp":-100,"rsrq":-14,"sinr":4,"operator":"Yettel","conntype":"5G"}]}`))
+		default:
+			http.NotFound(w, r)
 		}
-		if method != "get_live_stats" {
-			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":2,"result":[3,{}]}`))
-			return
-		}
-		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":2,"result":[0,{"rssi":-70,"rsrp":-100,"rsrq":-14,"sinr":4,"operator":"Yettel","conntype":"5G"}]}`))
 	}))
 	defer srv.Close()
 	c := newTeltonikaClient(Config{TeltonikaURL: srv.URL, TeltonikaUser: "stormwarden", TeltonikaPassword: "Secret1a", TeltonikaInsecureSkipVerify: true})
@@ -177,22 +167,13 @@ func TestModemEvidenceUsesDiagnosisCategory(t *testing.T) {
 func TestTeltonikaEmptyRadioDoesNotRelogin(t *testing.T) {
 	var logins atomic.Int32
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw, _ := io.ReadAll(r.Body)
-		var req struct {
-			Params []any `json:"params"`
-		}
-		_ = json.Unmarshal(raw, &req)
-		method := ""
-		if len(req.Params) > 2 {
-			method, _ = req.Params[2].(string)
-		}
 		w.Header().Set("Content-Type", "application/json")
-		if method == "login" {
+		if r.URL.Path == "/api/login" {
 			logins.Add(1)
-			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":[0,{"ubus_rpc_session":"sess","timeout":300,"expires":300}]}`))
+			_, _ = w.Write([]byte(`{"success":true,"data":{"token":"sess","expires":300}}`))
 			return
 		}
-		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":2,"result":[0,{"operator":"Yettel"}]}`))
+		_, _ = w.Write([]byte(`{"success":true,"data":[{"operator":"Yettel"}]}`))
 	}))
 	defer srv.Close()
 	c := newTeltonikaClient(Config{TeltonikaURL: srv.URL, TeltonikaUser: "u", TeltonikaPassword: "p", TeltonikaInsecureSkipVerify: true})
@@ -201,6 +182,45 @@ func TestTeltonikaEmptyRadioDoesNotRelogin(t *testing.T) {
 	}
 	if logins.Load() != 1 {
 		t.Fatalf("relogin on empty radio logins=%d", logins.Load())
+	}
+}
+
+func TestTeltonikaAuthRetry(t *testing.T) {
+	var logins, stats atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/login" {
+			logins.Add(1)
+			_, _ = w.Write([]byte(`{"success":true,"data":{"token":"sess","expires":300}}`))
+			return
+		}
+		if stats.Add(1) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"success":false}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"success":true,"data":[{"rsrp":-90,"rsrq":-12,"sinr":8}]}`))
+	}))
+	defer srv.Close()
+	c := newTeltonikaClient(Config{TeltonikaURL: srv.URL, TeltonikaUser: "u", TeltonikaPassword: "p", TeltonikaInsecureSkipVerify: true})
+	c.session, c.until = "stale", time.Now().Add(time.Minute)
+	sample, err := c.fetch(context.Background())
+	if err != nil || sample.RSRP == nil || *sample.RSRP != -90 {
+		t.Fatalf("retry=%v sample=%+v", err, sample)
+	}
+	if logins.Load() != 1 || stats.Load() != 2 {
+		t.Fatalf("logins=%d stats=%d", logins.Load(), stats.Load())
+	}
+}
+
+func TestParseModemStatsCASignal(t *testing.T) {
+	var data any
+	if err := json.Unmarshal([]byte(`{"band":"B3","rsrp":-96,"ca_signal":[{"band":"B7","primary":false}]}`), &data); err != nil {
+		t.Fatal(err)
+	}
+	s := parseModemStats(data)
+	if s.CABands != "B3+B7" || s.CACount != 2 {
+		t.Fatalf("ca %+v", s)
 	}
 }
 
@@ -223,26 +243,16 @@ func TestModemEvidenceOnWANIncident(t *testing.T) {
 func stubTeltonika(t *testing.T, stats *atomic.Int32) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw, _ := io.ReadAll(r.Body)
-		var req struct {
-			Params []any `json:"params"`
-		}
-		_ = json.Unmarshal(raw, &req)
-		method := ""
-		if len(req.Params) > 2 {
-			method, _ = req.Params[2].(string)
-		}
 		w.Header().Set("Content-Type", "application/json")
-		if method == "login" {
-			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":[0,{"ubus_rpc_session":"sess","timeout":300,"expires":300}]}`))
-			return
-		}
-		if method == "get_live_stats" {
+		switch r.URL.Path {
+		case "/api/login":
+			_, _ = w.Write([]byte(`{"success":true,"data":{"token":"sess","expires":300}}`))
+		case "/api/modems/status":
 			stats.Add(1)
-			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":2,"result":[0,{"rssi":-70,"rsrp":-100,"rsrq":-14,"sinr":4}]}`))
-			return
+			_, _ = w.Write([]byte(`{"success":true,"data":[{"rssi":-70,"rsrp":-100,"rsrq":-14,"sinr":4}]}`))
+		default:
+			http.NotFound(w, r)
 		}
-		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":2,"result":[3,{}]}`))
 	}))
 	t.Cleanup(srv.Close)
 	return srv

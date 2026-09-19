@@ -163,7 +163,7 @@ Gone → cadence resets. No all-clear mail. A failed SMTP send does not advance 
 
 ## Teltonika mobile radio
 
-Optional. Stormwarden polls RutOS JSON-RPC (`POST /ubus`) every 5 minutes for RSSI, RSRP, RSRQ, SINR, band, cell, operator, and carrier aggregation. Opening a WAN/DNS incident also fetches once, unless a poll already ran in that 5-minute window. Cached `gsm.modem*` stats only — no `gsmctl` / extra AT commands. One in-flight request, 5s timeout. Failures are logged and never change probe severity.
+Optional. Stormwarden polls RutOS Web API (`POST /api/login`, `GET /api/modems/status`) every 5 minutes for RSSI, RSRP, RSRQ, SINR, band, cell, operator, and carrier aggregation. Opening a WAN/DNS incident also fetches once, unless a poll already ran in that 5-minute window. One in-flight request, 5s timeout. Failures are logged and never change probe severity.
 
 Self-signed HTTPS:
 
@@ -184,16 +184,18 @@ Do not use `admin` / `root`. On the router:
    - **Hide sensitive information:** on
    - **Write action:** Deny
    - **Read action:** Allow
-   - **Read access** (paths after `#` in the WebUI URL):
+    - **Read access** (paths after `#` in the WebUI URL):
 
 | Path | Page |
 | --- | --- |
 | `status/network` | **Status → Network** (Mobile: RSSI, RSRP, RSRQ, SINR, CA, cell) |
 | `status/overview` | **Status → Overview** (login landing; needed so the user can open WebUI) |
 
+Also allow **API read** for `/modems/*` (or `/modems/status`). Stormwarden uses `GET /api/modems/status`, not WebUI JSON-RPC.
+
 If a path 404s in group settings, open that page as admin and copy the URL starting at `#`. Example: `https://192.168.1.1/#/status/network` → `status/network`.
 
-Default `user` cannot read Network. Without `status/network`, JSON-RPC radio calls are denied.
+Default `user` cannot read Network or the modem API. Without `/modems/status` read, the health check returns HTTP 403.
 
 ## Probe hierarchy and classification
 
