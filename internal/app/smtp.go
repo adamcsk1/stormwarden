@@ -33,6 +33,7 @@ var mailCategories = map[string]bool{
 	"external_dns":           true,
 	"dns_resolution_failure": true,
 	"local_dns":              true,
+	"radio_poor":             true,
 }
 
 type mailShot struct {

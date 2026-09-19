@@ -279,7 +279,84 @@ func (s ModemSample) evidenceLine() string {
 	if s.CellID != "" {
 		parts = append(parts, "cell="+s.CellID)
 	}
+	if g := radioGrade(s); g != "" {
+		parts = append(parts, "grade="+g)
+	}
 	return strings.Join(parts, " ")
+}
+
+func gradeRank(g string) int {
+	switch g {
+	case "good":
+		return 1
+	case "fair":
+		return 2
+	case "poor":
+		return 3
+	default:
+		return 0
+	}
+}
+
+func rsrpGrade(v float64) string {
+	switch {
+	case v >= -80:
+		return "excellent"
+	case v >= -90:
+		return "good"
+	case v >= -100:
+		return "fair"
+	default:
+		return "poor"
+	}
+}
+
+func rsrqGrade(v float64) string {
+	switch {
+	case v >= -10:
+		return "excellent"
+	case v >= -15:
+		return "good"
+	case v > -20:
+		return "fair"
+	default:
+		return "poor"
+	}
+}
+
+func sinrGrade(v float64) string {
+	switch {
+	case v >= 20:
+		return "excellent"
+	case v >= 13:
+		return "good"
+	case v > 0:
+		return "fair"
+	default:
+		return "poor"
+	}
+}
+
+func radioGrade(s ModemSample) string {
+	worst := ""
+	consider := func(g string) {
+		if g == "" {
+			return
+		}
+		if worst == "" || gradeRank(g) > gradeRank(worst) {
+			worst = g
+		}
+	}
+	if s.RSRP != nil {
+		consider(rsrpGrade(*s.RSRP))
+	}
+	if s.RSRQ != nil {
+		consider(rsrqGrade(*s.RSRQ))
+	}
+	if s.SINR != nil {
+		consider(sinrGrade(*s.SINR))
+	}
+	return worst
 }
 
 func parseModemStats(v any) ModemSample {
@@ -467,25 +544,59 @@ func (a *App) pollModem(ctx context.Context) {
 	if a.teltonika == nil {
 		return
 	}
-	if !a.modemMu.TryLock() {
+	sample, skipped, err := a.takeModemSample(ctx, false)
+	if skipped {
 		return
 	}
-	defer a.modemMu.Unlock()
-	if !a.lastModemAttempt.IsZero() && time.Since(a.lastModemAttempt) < teltonikaPollInterval {
+	if err != nil {
+		a.logger.Error("teltonika modem poll failed", "error", redactSMTPErr(err, a.cfg.TeltonikaPassword))
 		return
+	}
+	a.updateRadioIncident(ctx, sample)
+}
+
+func (a *App) takeModemSample(ctx context.Context, force bool) (ModemSample, bool, error) {
+	if a.teltonika == nil {
+		return ModemSample{}, true, nil
+	}
+	if force {
+		a.modemMu.Lock()
+	} else if !a.modemMu.TryLock() {
+		return ModemSample{}, true, nil
+	}
+	defer a.modemMu.Unlock()
+	if !force && !a.lastModemAttempt.IsZero() && time.Since(a.lastModemAttempt) < teltonikaPollInterval {
+		return ModemSample{}, true, nil
 	}
 	a.lastModemAttempt = time.Now()
 	pollCtx, cancel := context.WithTimeout(ctx, teltonikaHTTPTimeout)
 	defer cancel()
 	sample, err := a.teltonika.fetch(pollCtx)
 	if err != nil {
-		a.logger.Error("teltonika modem poll failed", "error", redactSMTPErr(err, a.cfg.TeltonikaPassword))
-		return
+		return ModemSample{}, false, err
 	}
 	sample.CreatedAt = time.Now()
 	if err := insertModemSample(ctx, a.db, sample); err != nil {
 		a.logger.Error("modem sample persistence failed", "error", err)
 	}
+	return sample, false, nil
+}
+
+func (a *App) updateRadioIncident(ctx context.Context, s ModemSample) {
+	observed := map[string]bool{"radio_poor": true}
+	if radioGrade(s) != "poor" {
+		a.updateIncidents(ctx, nil, observed)
+		return
+	}
+	issue := Sample{
+		CreatedAt:       time.Now(),
+		ProbeType:       "aggregate",
+		Target:          "radio_poor",
+		Severity:        Error,
+		Message:         "Teltonika radio poor: " + s.evidenceLine(),
+		incidentContext: s.evidenceLine(),
+	}
+	a.updateIncidents(ctx, []Sample{issue}, observed)
 }
 
 func wantsModemEvidence(issue Sample) bool {

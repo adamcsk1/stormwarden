@@ -736,7 +736,7 @@ func (a *App) updateIncidents(ctx context.Context, issues []Sample, observed map
 			}
 			if state.badCycles >= 2 {
 				if wantsModemEvidence(issue) {
-					a.pollModem(ctx)
+					_, _, _ = a.takeModemSample(ctx, false)
 				}
 				a.attachModemEvidence(ctx, &issue)
 				a.attachModemEvidence(ctx, &state.peakIssue)

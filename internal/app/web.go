@@ -547,6 +547,16 @@ func (a *App) modemFragment(w http.ResponseWriter, r *http.Request) {
 		view["MaxRSRP"] = nullRadio(stats.MaxRSRP, "dBm", 0)
 		view["MinSINR"] = nullRadio(stats.MinSINR, "dB", 1)
 		view["MaxSINR"] = nullRadio(stats.MaxSINR, "dB", 1)
+		grade := radioGrade(*sample)
+		view["Grade"] = grade
+		switch grade {
+		case "poor":
+			view["GradeSeverity"] = "error"
+		case "fair":
+			view["GradeSeverity"] = "warning"
+		default:
+			view["GradeSeverity"] = "info"
+		}
 	}
 	a.render(w, "modem.html", view)
 }
@@ -733,19 +743,14 @@ func (a *App) runTeltonikaHealth(ctx context.Context) (string, error) {
 	if a.teltonika == nil {
 		return "", errors.New("not configured")
 	}
-	a.modemMu.Lock()
-	defer a.modemMu.Unlock()
-	a.lastModemAttempt = time.Now()
-	pollCtx, cancel := context.WithTimeout(ctx, teltonikaHTTPTimeout)
-	defer cancel()
-	sample, err := a.teltonika.fetch(pollCtx)
+	sample, skipped, err := a.takeModemSample(ctx, true)
 	if err != nil {
 		return "", err
 	}
-	sample.CreatedAt = time.Now()
-	if err := insertModemSample(ctx, a.db, sample); err != nil {
-		return "", err
+	if skipped {
+		return "", errors.New("not configured")
 	}
+	a.updateRadioIncident(ctx, sample)
 	line := sample.evidenceLine()
 	if line == "" {
 		return "Teltonika login ok; no radio metrics yet", nil
