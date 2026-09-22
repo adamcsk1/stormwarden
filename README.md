@@ -159,7 +159,7 @@ Per category, not per poll (same cadence as elprotector):
 3. Still open 4 hours after that
 4. Then once a day until it is gone
 
-Gone → cadence resets. No all-clear mail. A failed SMTP send does not advance the counter and does not stop probing. Failed attempts wait 15 minutes before retry. SMTP runs in the background with a 30s timeout so a dead WAN cannot stall health checks.
+Gone → cadence resets after that alert was sent. An unsent alert is kept and sent once when SMTP works again; that mail names the problem time, not only the send time. No all-clear mail. A failed SMTP send does not advance the counter and does not stop probing. Failed attempts wait 15 minutes before retry. SMTP runs in the background with a 30s timeout so a dead WAN cannot stall health checks.
 
 ## Teltonika mobile radio
 

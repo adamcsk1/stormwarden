@@ -13,7 +13,7 @@ import (
 )
 
 func TestSyncMailStateCadence(t *testing.T) {
-	current := map[string]string{"local_dns": "Pi-hole failed"}
+	current := map[string]mailIssue{"local_dns": {Summary: "Pi-hole failed"}}
 	t0 := int64(1_000_000)
 	due, state := syncMailState(current, mailState{}, t0)
 	if len(due) != 1 || due[0] != "local_dns" {
@@ -55,7 +55,7 @@ func TestSyncMailStateCadence(t *testing.T) {
 	}
 	markMailSent(&state, due, t3+24*3600)
 
-	due, state = syncMailState(map[string]string{}, state, t3+25*3600)
+	due, state = syncMailState(map[string]mailIssue{}, state, t3+25*3600)
 	if len(due) != 0 || len(state.Issues) != 0 {
 		t.Fatalf("cleared due=%v issues=%v", due, state.Issues)
 	}
@@ -63,6 +63,64 @@ func TestSyncMailStateCadence(t *testing.T) {
 	due, _ = syncMailState(current, state, t3+26*3600)
 	if len(due) != 1 {
 		t.Fatalf("reopened due=%v", due)
+	}
+}
+
+func TestSyncMailStateKeepsUnsentAfterClear(t *testing.T) {
+	t0 := int64(1_700_000_000)
+	current := map[string]mailIssue{"internet_outage": {Summary: "WAN down", StartedAt: t0}}
+	due, state := syncMailState(current, mailState{}, t0)
+	if len(due) != 1 {
+		t.Fatalf("due=%v", due)
+	}
+	markMailAttempt(&state, due, t0)
+
+	due, state = syncMailState(map[string]mailIssue{}, state, t0+60)
+	if len(due) != 1 || len(state.Issues) != 1 || state.Issues["internet_outage"].Summary != "WAN down" {
+		t.Fatalf("dropped unsent due=%v issues=%v", due, state.Issues)
+	}
+
+	due, state = syncMailState(map[string]mailIssue{"internet_outage": {Summary: "WAN down", StartedAt: t0 + 120}}, state, t0+120)
+	rec := state.Issues["internet_outage"]
+	if len(due) != 1 || rec.Sent != 0 || len(rec.Times) != 2 {
+		t.Fatalf("flap due=%v rec=%+v", due, rec)
+	}
+}
+
+func TestMarkMailSentSkipsPassedCadence(t *testing.T) {
+	t0 := int64(1_700_000_000)
+	state := mailState{Issues: map[string]mailShot{"internet_outage": {FirstSeen: t0, Summary: "WAN down"}}}
+	markMailSent(&state, []string{"internet_outage"}, t0+10*3600)
+	rec := state.Issues["internet_outage"]
+	if rec.Sent < 2 {
+		t.Fatalf("did not skip passed shot: %+v", rec)
+	}
+	due, _ := syncMailState(map[string]mailIssue{"internet_outage": {Summary: "WAN down", StartedAt: t0}}, state, t0+10*3600+60)
+	if len(due) != 0 {
+		t.Fatalf("immediate extra mail due=%v rec=%+v", due, rec)
+	}
+}
+
+func TestFormatMailDelayedProblemTime(t *testing.T) {
+	state := mailState{Issues: map[string]mailShot{
+		"internet_outage": {FirstSeen: 100, Summary: "WAN down", Times: []int64{100, 250}},
+		"local_dns":       {FirstSeen: 100, Summary: "down"},
+	}}
+	live := formatMail("host", time.Unix(100, 0).UTC(), state, []string{"local_dns"}, nil)
+	if strings.Contains(live, "Problem time") || !strings.Contains(live, "local_dns: down") {
+		t.Fatalf("live body=%s", live)
+	}
+	one := formatMail("host", time.Unix(200, 0).UTC(), state, []string{"internet_outage"}, []string{"internet_outage"})
+	if !strings.Contains(one, "Problem time was 1970-01-01 00:01:40 UTC.") || !strings.Contains(one, "Happened:") || !strings.Contains(one, "1970-01-01 00:04:10 UTC") {
+		t.Fatalf("delayed body=%s", one)
+	}
+	many := formatMail("host", time.Unix(200, 0).UTC(), state, []string{"internet_outage", "local_dns"}, []string{"internet_outage", "local_dns"})
+	if !strings.Contains(many, "Problem times:") || !strings.Contains(many, "internet_outage: 1970-01-01 00:01:40 UTC, 1970-01-01 00:04:10 UTC") || !strings.Contains(many, "local_dns: 1970-01-01 00:01:40 UTC") {
+		t.Fatalf("multi body=%s", many)
+	}
+	mixed := formatMail("host", time.Unix(200, 0).UTC(), state, []string{"internet_outage", "local_dns"}, []string{"internet_outage"})
+	if strings.Contains(mixed, "Problem time was") || !strings.Contains(mixed, "Problem times:") || !strings.Contains(mixed, "internet_outage: 1970-01-01 00:01:40 UTC, 1970-01-01 00:04:10 UTC") {
+		t.Fatalf("mixed body=%s", mixed)
 	}
 }
 
@@ -154,6 +212,61 @@ func TestSendDueMailAndFailDoesNotAdvance(t *testing.T) {
 	a.sendDueMail(ctx, now.Add(16*time.Minute))
 	if sent != 2 {
 		t.Fatalf("duplicate first shot sends=%d", sent)
+	}
+}
+
+func TestSendDueMailQueuedAfterClear(t *testing.T) {
+	a := newTestApp(t)
+	ctx := context.Background()
+	now := time.Unix(1_700_000_000, 0).UTC()
+	issue := Sample{ProbeType: "aggregate", Target: "internet_outage", Severity: Error, Message: "WAN down"}
+	a.updateIncident(ctx, issue)
+	a.updateIncident(ctx, issue)
+	a.cfg.SMTPHost = "smtp.example"
+	a.cfg.SMTPTo = "ops@example"
+
+	a.sendMail = func(subject, body string) error {
+		return errors.New("dial tcp: i/o timeout")
+	}
+	a.sendDueMail(ctx, now)
+
+	active, err := activeIncidents(ctx, a.db)
+	if err != nil || len(active) != 1 {
+		t.Fatalf("active=%d err=%v", len(active), err)
+	}
+	started := active[0].StartedAt.UTC().Format(mailTimeLayout)
+	if err := closeIncident(ctx, a.db, active[0].ID); err != nil {
+		t.Fatal(err)
+	}
+
+	var bodies []string
+	a.sendMail = func(subject, body string) error {
+		bodies = append(bodies, body)
+		return nil
+	}
+	a.sendDueMail(ctx, now.Add(time.Minute))
+	if len(bodies) != 0 {
+		t.Fatalf("sent inside cooldown: %d", len(bodies))
+	}
+	a.sendDueMail(ctx, now.Add(time.Duration(mailRetrySecs)*time.Second))
+	if len(bodies) != 1 || !strings.Contains(bodies[0], "Problem time was "+started+".") || !strings.Contains(bodies[0], "internet_outage: WAN down") {
+		t.Fatalf("bodies=%v", bodies)
+	}
+	state, err := loadMailState(ctx, a.db)
+	if err != nil || len(state.Issues) != 0 {
+		t.Fatalf("queued shot kept after send: %+v err=%v", state.Issues, err)
+	}
+	a.sendDueMail(ctx, now.Add(time.Duration(mailRetrySecs)*time.Second+time.Minute))
+	if len(bodies) != 1 {
+		t.Fatalf("duplicate sends=%d", len(bodies))
+	}
+
+	if err := openIncident(ctx, a.db, issue); err != nil {
+		t.Fatal(err)
+	}
+	a.sendDueMail(ctx, now.Add(time.Duration(mailRetrySecs)*time.Second+2*time.Minute))
+	if len(bodies) != 2 || strings.Contains(bodies[1], "Problem time was") {
+		t.Fatalf("reopen bodies=%v", bodies)
 	}
 }
 
