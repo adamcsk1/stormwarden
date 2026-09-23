@@ -230,6 +230,9 @@ func (a *App) writeExport(ctx context.Context, zw *zip.Writer, from, to time.Tim
 	if err := a.zipIncidents(ctx, tx, zw, fromText, toText); err != nil {
 		return err
 	}
+	if err := a.zipModemSamples(ctx, tx, zw, fromText, toText); err != nil {
+		return err
+	}
 	dnsPaths, err := loadDNSPathSummaries(ctx, tx, fromText, toText)
 	if err != nil {
 		return err
@@ -331,6 +334,34 @@ func (a *App) zipIncidents(ctx context.Context, tx *sql.Tx, zw *zip.Writer, from
 		if len(batch) < 1000 {
 			break
 		}
+	}
+	return buffer.Flush()
+}
+
+func (a *App) zipModemSamples(ctx context.Context, tx *sql.Tx, zw *zip.Writer, from, to string) error {
+	w, err := zw.Create("modem-samples.jsonl")
+	if err != nil {
+		return err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id, created_at, rssi, rsrp, rsrq, sinr, rscp, ecio, ca_count, band, ca_bands, operator, network_type, cell_id, message
+FROM modem_samples WHERE created_at>=? AND created_at<? ORDER BY id`, from, to)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	buffer := bufio.NewWriter(w)
+	encoder := json.NewEncoder(buffer)
+	for rows.Next() {
+		sample, err := scanModemSample(rows)
+		if err != nil {
+			return err
+		}
+		if err := encoder.Encode(sample); err != nil {
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
 	}
 	return buffer.Flush()
 }

@@ -240,6 +240,36 @@ func TestModemEvidenceOnWANIncident(t *testing.T) {
 	}
 }
 
+func TestIncidentTimelineIncludesNearbyModemSample(t *testing.T) {
+	now := time.Now().Truncate(time.Millisecond)
+	rsrp := -96.0
+	lines := formatIncidentTimeline(
+		[]Sample{{CreatedAt: now.Add(time.Minute), Target: "tcp:cloudflare", Severity: Error, DurationMS: 4000}},
+		[]ModemSample{{CreatedAt: now, RSRP: &rsrp, Band: "B3", NetworkType: "LTE"}},
+		time.UTC,
+	)
+	if len(lines) != 2 || !strings.Contains(lines[0], "mobile radio") || !strings.Contains(lines[0], "rsrp=-96dBm") || !strings.Contains(lines[1], "tcp:cloudflare") {
+		t.Fatalf("timeline=%q", lines)
+	}
+}
+
+func TestModemFragmentMarksOldReadingStale(t *testing.T) {
+	a := newTestApp(t)
+	a.cfg.TeltonikaURL, a.cfg.TeltonikaPassword = "https://192.0.2.1", "Secret1a"
+	rsrp := -96.0
+	if err := insertModemSample(context.Background(), a.db, ModemSample{CreatedAt: time.Now().Add(-2*teltonikaPollInterval - time.Second), RSRP: &rsrp}); err != nil {
+		t.Fatal(err)
+	}
+	cookie := login(t, a)
+	request := httptest.NewRequest(http.MethodGet, "/ui/modem", nil)
+	request.AddCookie(cookie)
+	result := httptest.NewRecorder()
+	a.Handler().ServeHTTP(result, request)
+	if result.Code != http.StatusOK || !strings.Contains(result.Body.String(), ">stale<") {
+		t.Fatalf("modem fragment status=%d body=%s", result.Code, result.Body.String())
+	}
+}
+
 func stubTeltonika(t *testing.T, stats *atomic.Int32) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

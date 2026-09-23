@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -754,6 +755,9 @@ func TestExportContainsBoundedAIData(t *testing.T) {
 	outside.Message = "outside"
 	_ = insertSample(context.Background(), a.db, inside)
 	_ = insertSample(context.Background(), a.db, outside)
+	rsrp := -96.0
+	_ = insertModemSample(context.Background(), a.db, ModemSample{CreatedAt: time.Now(), RSRP: &rsrp, Operator: "Yettel"})
+	_ = insertModemSample(context.Background(), a.db, ModemSample{CreatedAt: time.Now().Add(-48 * time.Hour), RSRP: &rsrp, Operator: "Old Carrier"})
 	_, _ = a.db.Exec(`INSERT INTO incidents(started_at, severity, category, summary, evidence) VALUES (?, 'error', 'outage', 'overlapping', '')`, dbTime(time.Now().Add(-48*time.Hour)))
 	job := exportJob{ID: "test-export", RangeName: "day", From: time.Now().Add(-24 * time.Hour), To: time.Now().Add(time.Minute)}
 	_, _ = a.db.Exec(`INSERT INTO exports(id, created_at, range_name, path, size, status) VALUES (?, ?, 'day', '', 0, 'pending')`, job.ID, dbTime(time.Now()))
@@ -769,7 +773,7 @@ func TestExportContainsBoundedAIData(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	wanted := map[string]bool{"summary.md": false, "measurements.jsonl": false, "incidents.jsonl": false, "dns-path-summary.json": false, "quarter-hour-rollups.jsonl": false, "settings-redacted.json": false}
+	wanted := map[string]bool{"summary.md": false, "measurements.jsonl": false, "incidents.jsonl": false, "modem-samples.jsonl": false, "dns-path-summary.json": false, "quarter-hour-rollups.jsonl": false, "settings-redacted.json": false}
 	for _, file := range reader.File {
 		if _, ok := wanted[file.Name]; ok {
 			wanted[file.Name] = true
@@ -788,6 +792,18 @@ func TestExportContainsBoundedAIData(t *testing.T) {
 			_ = stream.Close()
 			if !strings.Contains(string(data), "overlapping") {
 				t.Fatal("overlapping incident omitted")
+			}
+		}
+		if file.Name == "modem-samples.jsonl" {
+			stream, _ := file.Open()
+			data, _ := io.ReadAll(stream)
+			_ = stream.Close()
+			if strings.Contains(string(data), "Old Carrier") {
+				t.Fatal("modem export ignored time bounds")
+			}
+			var sample map[string]any
+			if err := json.Unmarshal(data, &sample); err != nil || sample["operator"] != "Yettel" || sample["created_at"] == nil || sample["rsrp"] == nil {
+				t.Fatalf("modem export=%s err=%v", data, err)
 			}
 		}
 	}

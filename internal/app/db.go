@@ -706,6 +706,24 @@ func latestModemSample(ctx context.Context, db *sql.DB) (*ModemSample, error) {
 	return &s, nil
 }
 
+func modemSamplesBetween(ctx context.Context, db *sql.DB, from, to time.Time, limit int) ([]ModemSample, error) {
+	rows, err := db.QueryContext(ctx, `SELECT id, created_at, rssi, rsrp, rsrq, sinr, rscp, ecio, ca_count, band, ca_bands, operator, network_type, cell_id, message
+FROM modem_samples WHERE created_at>=? AND created_at<? ORDER BY created_at LIMIT ?`, dbTime(from), dbTime(to), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []ModemSample
+	for rows.Next() {
+		sample, err := scanModemSample(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, sample)
+	}
+	return result, rows.Err()
+}
+
 type modemDayStats struct {
 	Samples                                                                int
 	MinRSRP, MaxRSRP, MinRSRQ, MaxRSRQ, MinSINR, MaxSINR, MinRSSI, MaxRSSI sql.NullFloat64

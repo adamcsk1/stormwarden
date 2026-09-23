@@ -243,6 +243,7 @@ Dashboard generates ZIP reports (day, week, month, custom, all). Each report con
 - `summary.md`: coverage, classification counts, day-over-day TCP anomalies, A/B vs the previous equal window, annotations
 - `measurements.jsonl`: raw probes
 - `incidents.jsonl`: classified problem log with evidence and contradictions
+- `modem-samples.jsonl`: Teltonika radio readings collected during the report period
 - `annotations.json`: manual network-change markers
 - `settings-redacted.json`: diagnostic configuration without secrets
 - `system-info.json`: runtime and discovered network context
