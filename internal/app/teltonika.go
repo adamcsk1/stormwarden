@@ -29,21 +29,21 @@ var modemEvidenceCategories = map[string]bool{
 }
 
 type ModemSample struct {
-	ID          int64
-	CreatedAt   time.Time
-	RSSI        *float64
-	RSRP        *float64
-	RSRQ        *float64
-	SINR        *float64
-	RSCP        *float64
-	EcIo        *float64
-	CACount     int
-	Band        string
-	CABands     string
-	Operator    string
-	NetworkType string
-	CellID      string
-	Message     string
+	ID          int64     `json:"id"`
+	CreatedAt   time.Time `json:"created_at"`
+	RSSI        *float64  `json:"rssi,omitempty"`
+	RSRP        *float64  `json:"rsrp,omitempty"`
+	RSRQ        *float64  `json:"rsrq,omitempty"`
+	SINR        *float64  `json:"sinr,omitempty"`
+	RSCP        *float64  `json:"rscp,omitempty"`
+	EcIo        *float64  `json:"ecio,omitempty"`
+	CACount     int       `json:"ca_count"`
+	Band        string    `json:"band,omitempty"`
+	CABands     string    `json:"ca_bands,omitempty"`
+	Operator    string    `json:"operator,omitempty"`
+	NetworkType string    `json:"network_type,omitempty"`
+	CellID      string    `json:"cell_id,omitempty"`
+	Message     string    `json:"message,omitempty"`
 }
 
 type teltonikaClient struct {

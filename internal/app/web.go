@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -432,16 +433,22 @@ func (a *App) toIncidentView(incident Incident, withTimeline bool) incidentView 
 			end = incident.EndedAt.Add(30 * time.Second)
 		}
 		samples, _ := samplesBetween(context.Background(), a.db, incident.StartedAt.Add(-30*time.Second), end, 80)
-		view.Timeline = formatTimeline(samples, a.cfg.Timezone)
+		modem, _ := modemSamplesBetween(context.Background(), a.db, incident.StartedAt.Add(-10*time.Minute), end, 20)
+		view.Timeline = formatIncidentTimeline(samples, modem, a.cfg.Timezone)
 	}
 	return view
 }
 
-func formatTimeline(samples []Sample, loc *time.Location) []string {
+type timelineEntry struct {
+	at   time.Time
+	line string
+}
+
+func formatIncidentTimeline(samples []Sample, modem []ModemSample, loc *time.Location) []string {
 	if loc == nil {
 		loc = time.UTC
 	}
-	lines := make([]string, 0, len(samples))
+	entries := make([]timelineEntry, 0, len(samples)+len(modem))
 	for _, s := range samples {
 		state := strings.ToUpper(string(s.Severity))
 		if s.Success && s.Severity == Info {
@@ -457,7 +464,22 @@ func formatTimeline(samples []Sample, loc *time.Location) []string {
 		if retransmissionSuspected(s.ConnectMS) || retransmissionSuspected(s.DurationMS) {
 			detail += "  tcp_retransmission_suspected"
 		}
-		lines = append(lines, fmt.Sprintf("%s  %-22s %-8s %s", s.CreatedAt.In(loc).Format("15:04:05.000"), s.Target, state, detail))
+		entries = append(entries, timelineEntry{at: s.CreatedAt, line: fmt.Sprintf("%-22s %-8s %s", s.Target, state, detail)})
+	}
+	for _, s := range modem {
+		line := s.evidenceLine()
+		if line == "" {
+			line = s.Message
+		}
+		if line == "" {
+			line = "no radio metrics"
+		}
+		entries = append(entries, timelineEntry{at: s.CreatedAt, line: "mobile radio           INFO     " + line})
+	}
+	sort.SliceStable(entries, func(i, j int) bool { return entries[i].at.Before(entries[j].at) })
+	lines := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		lines = append(lines, fmt.Sprintf("%s  %s", entry.at.In(loc).Format("15:04:05.000"), entry.line))
 	}
 	return lines
 }
@@ -550,6 +572,7 @@ func (a *App) modemFragment(w http.ResponseWriter, r *http.Request) {
 		view["MaxSINR"] = nullRadio(stats.MaxSINR, "dB", 1)
 		grade := radioGrade(*sample)
 		view["Grade"] = grade
+		view["Stale"] = time.Since(sample.CreatedAt) > 2*teltonikaPollInterval
 		switch grade {
 		case "poor":
 			view["GradeSeverity"] = "error"
