@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Stormwarden</title>
+  <desc id="desc">A shield protecting against a lightning storm</desc>
+  <path fill="#10201c" d="M128 12 224 48v68c0 62-40 105-96 128C72 221 32 178 32 116V48z"/>
+  <path fill="#6ee7b7" d="M128 20 216 53v63c0 57-36 97-88 119-52-22-88-62-88-119V53zm0 10L49 60v56c0 49 29 85 79 108 50-23 79-59 79-108V60z"/>
+  <path fill="#f5c451" d="m151 48-68 99h43l-23 65 70-97h-42z"/>
+</svg>
