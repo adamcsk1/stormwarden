@@ -174,9 +174,21 @@ CREATE TABLE IF NOT EXISTS daily_rollups_v2 (
   operator TEXT NOT NULL DEFAULT '',
   network_type TEXT NOT NULL DEFAULT '',
   cell_id TEXT NOT NULL DEFAULT '',
+  tac TEXT NOT NULL DEFAULT '',
+  lte_pci TEXT NOT NULL DEFAULT '',
+  nr_pci TEXT NOT NULL DEFAULT '',
+  earfcn TEXT NOT NULL DEFAULT '',
+  nr_arfcn TEXT NOT NULL DEFAULT '',
+  mcc TEXT NOT NULL DEFAULT '',
+  mnc TEXT NOT NULL DEFAULT '',
   message TEXT NOT NULL DEFAULT ''
 ); CREATE INDEX IF NOT EXISTS idx_modem_samples_created ON modem_samples(created_at DESC)`); err != nil {
 		return err
+	}
+	for _, column := range []string{"tac", "lte_pci", "nr_pci", "earfcn", "nr_arfcn", "mcc", "mnc"} {
+		if err := ensureColumn(db, "modem_samples", column, "TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
 	}
 	if value, _ := setting(context.Background(), db, "fixed_timestamps_v1"); value != "done" {
 		tx, err := db.Begin()
@@ -687,15 +699,15 @@ func scanNullFloat(n sql.NullFloat64) *float64 {
 }
 
 func insertModemSample(ctx context.Context, db *sql.DB, s ModemSample) error {
-	_, err := db.ExecContext(ctx, `INSERT INTO modem_samples(created_at, rssi, rsrp, rsrq, sinr, rscp, ecio, ca_count, band, ca_bands, operator, network_type, cell_id, message)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	_, err := db.ExecContext(ctx, `INSERT INTO modem_samples(created_at, rssi, rsrp, rsrq, sinr, rscp, ecio, ca_count, band, ca_bands, operator, network_type, cell_id, tac, lte_pci, nr_pci, earfcn, nr_arfcn, mcc, mnc, message)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		dbTime(s.CreatedAt), nullFloat(s.RSSI), nullFloat(s.RSRP), nullFloat(s.RSRQ), nullFloat(s.SINR), nullFloat(s.RSCP), nullFloat(s.EcIo),
-		s.CACount, s.Band, s.CABands, s.Operator, s.NetworkType, s.CellID, s.Message)
+		s.CACount, s.Band, s.CABands, s.Operator, s.NetworkType, s.CellID, s.TAC, s.LTEPCI, s.NRPCI, s.EARFCN, s.NRARFCN, s.MCC, s.MNC, s.Message)
 	return err
 }
 
 func latestModemSample(ctx context.Context, db *sql.DB) (*ModemSample, error) {
-	row := db.QueryRowContext(ctx, `SELECT id, created_at, rssi, rsrp, rsrq, sinr, rscp, ecio, ca_count, band, ca_bands, operator, network_type, cell_id, message FROM modem_samples ORDER BY id DESC LIMIT 1`)
+	row := db.QueryRowContext(ctx, `SELECT id, created_at, rssi, rsrp, rsrq, sinr, rscp, ecio, ca_count, band, ca_bands, operator, network_type, cell_id, tac, lte_pci, nr_pci, earfcn, nr_arfcn, mcc, mnc, message FROM modem_samples ORDER BY id DESC LIMIT 1`)
 	s, err := scanModemSample(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -707,7 +719,7 @@ func latestModemSample(ctx context.Context, db *sql.DB) (*ModemSample, error) {
 }
 
 func modemSamplesBetween(ctx context.Context, db *sql.DB, from, to time.Time, limit int) ([]ModemSample, error) {
-	rows, err := db.QueryContext(ctx, `SELECT id, created_at, rssi, rsrp, rsrq, sinr, rscp, ecio, ca_count, band, ca_bands, operator, network_type, cell_id, message
+	rows, err := db.QueryContext(ctx, `SELECT id, created_at, rssi, rsrp, rsrq, sinr, rscp, ecio, ca_count, band, ca_bands, operator, network_type, cell_id, tac, lte_pci, nr_pci, earfcn, nr_arfcn, mcc, mnc, message
 FROM modem_samples WHERE created_at>=? AND created_at<? ORDER BY created_at LIMIT ?`, dbTime(from), dbTime(to), limit)
 	if err != nil {
 		return nil, err
@@ -744,7 +756,7 @@ func scanModemSample(row modemRow) (ModemSample, error) {
 	var s ModemSample
 	var created string
 	var rssi, rsrp, rsrq, sinr, rscp, ecio sql.NullFloat64
-	err := row.Scan(&s.ID, &created, &rssi, &rsrp, &rsrq, &sinr, &rscp, &ecio, &s.CACount, &s.Band, &s.CABands, &s.Operator, &s.NetworkType, &s.CellID, &s.Message)
+	err := row.Scan(&s.ID, &created, &rssi, &rsrp, &rsrq, &sinr, &rscp, &ecio, &s.CACount, &s.Band, &s.CABands, &s.Operator, &s.NetworkType, &s.CellID, &s.TAC, &s.LTEPCI, &s.NRPCI, &s.EARFCN, &s.NRARFCN, &s.MCC, &s.MNC, &s.Message)
 	if err != nil {
 		return ModemSample{}, err
 	}

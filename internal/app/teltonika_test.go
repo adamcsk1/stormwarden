@@ -30,6 +30,91 @@ func TestParseModemStatsNested(t *testing.T) {
 	}
 }
 
+func TestRUTX50BulkCellInfo(t *testing.T) {
+	const status = `{"success":true,"data":[{"success":true,"data":[{"operator":"Example Network","conntype":"5G (NSA)","mode":0,"band":"LTE B3","rsrp":-77,"cellid":"123456","tac":"4321","imei":"synthetic-imei","imsi":"synthetic-imsi","cell_info":[{"earfcn":1850,"nr-arfcn":"N/A","pcid":315,"tac":"4321","cellid":"123456","mcc":"999","mnc":"01"},{"earfcn":"N/A","nr-arfcn":427010,"pcid":218,"tac":"N/A","cellid":"123456","mcc":"999","mnc":"01"}]}]},{"success":true,"data":[{"sim":"2"}]}]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/login":
+			_, _ = w.Write([]byte(`{"success":true,"data":{"token":"session","expires":300}}`))
+		case "/api/modems/status":
+			_, _ = w.Write([]byte(status))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	a := newTestApp(t)
+	a.cfg.TeltonikaURL, a.cfg.TeltonikaPassword = srv.URL, "test"
+	a.teltonika = newTeltonikaClient(Config{TeltonikaURL: srv.URL, TeltonikaUser: "u", TeltonikaPassword: "test"})
+	a.pollModem(context.Background())
+	s, err := latestModemSample(context.Background(), a.db)
+	if err != nil || s == nil {
+		t.Fatalf("stored sample=%+v error=%v", s, err)
+	}
+	if s.NetworkType != "5G (NSA)" || s.CellID != "123456" || s.TAC != "4321" || s.LTEPCI != "315" || s.NRPCI != "218" || s.EARFCN != "1850" || s.NRARFCN != "427010" || s.MCC != "999" || s.MNC != "01" {
+		t.Fatalf("parsed cell info=%+v", s)
+	}
+	if strings.Contains(s.Message, "synthetic-imei") || strings.Contains(s.Message, "synthetic-imsi") {
+		t.Fatalf("device identifiers persisted in evidence: %s", s.Message)
+	}
+	result := httptest.NewRecorder()
+	a.modemFragment(result, httptest.NewRequest(http.MethodGet, "/ui/modem", nil))
+	for _, text := range []string{"Cell info", "<span>Cell ID</span><strong>123456</strong>", "<span>TAC</span><strong>4321</strong>", "<strong>315 / 218</strong>", "<strong>1850 / 427010</strong>", "<strong>999</strong>", "<strong>01</strong>"} {
+		if result.Code != http.StatusOK || !strings.Contains(result.Body.String(), text) {
+			t.Fatalf("missing %q in modem status=%d body=%s", text, result.Code, result.Body.String())
+		}
+	}
+}
+
+func TestCellInfoIgnoresUnavailableFieldsAndKeepsPCISeparate(t *testing.T) {
+	var data any
+	if err := json.Unmarshal([]byte(`{"rsrp":-90,"tac":"N/A","cell_info":[{"earfcn":1800,"pcid":315,"tac":"4567","mcc":"216","mnc":"01"},{"earfcn":"N/A","nr-arfcn":427010,"pcid":218}]}`), &data); err != nil {
+		t.Fatal(err)
+	}
+	s := parseModemStats(data)
+	if s.CellID != "" || s.TAC != "4567" || s.LTEPCI != "315" || s.NRPCI != "218" || s.MNC != "01" {
+		t.Fatalf("missing cell ID or unavailable TAC misparsed: %+v", s)
+	}
+	var pciOnly any
+	_ = json.Unmarshal([]byte(`{"rsrp":-90,"pci":315}`), &pciOnly)
+	s = parseModemStats(pciOnly)
+	if s.CellID != "" || s.LTEPCI != "315" {
+		t.Fatalf("PCI mistaken for Cell ID: %+v", s)
+	}
+}
+
+func TestBulkStatusDoesNotMixModemCells(t *testing.T) {
+	var data any
+	if err := json.Unmarshal([]byte(`[{"success":true,"data":[{"cell_info":[{"earfcn":1850,"pcid":111}],"cellid":"idle-cell"},{"rsrp":-85,"cellid":"live-cell","cell_info":[{"earfcn":1950,"pcid":222,"mnc":"01"}]}]},{"success":true,"data":[{"sim":"2"}]}]`), &data); err != nil {
+		t.Fatal(err)
+	}
+	s, ok := firstRadioSample(data)
+	if !ok || s.CellID != "live-cell" || s.LTEPCI != "222" || s.EARFCN != "1950" || s.MNC != "01" {
+		t.Fatalf("cell fields combined across modems: %+v", s)
+	}
+}
+
+func TestBulkWrapperCannotSupplyRadioAfterEmptyModems(t *testing.T) {
+	var data any
+	if err := json.Unmarshal([]byte(`{"success":true,"rsrp":-90,"data":[{"cellid":"idle"}]}`), &data); err != nil {
+		t.Fatal(err)
+	}
+	if s, ok := firstRadioSample(data); ok {
+		t.Fatalf("non-modem wrapper counted as radio: %+v", s)
+	}
+}
+
+func TestNRChannelDoesNotBecomeLTEPCI(t *testing.T) {
+	var data any
+	if err := json.Unmarshal([]byte(`{"rsrp":-85,"pci":218,"cell_info":[{"earfcn":"N/A","nr-arfcn":427010,"pcid":"N/A"}]}`), &data); err != nil {
+		t.Fatal(err)
+	}
+	s := parseModemStats(data)
+	if s.NRARFCN != "427010" || s.NRPCI != "" || s.LTEPCI != "" || s.CellID != "" {
+		t.Fatalf("missing NR PCI mislabeled LTE: %+v", s)
+	}
+}
+
 func TestParseModemStatsUnits(t *testing.T) {
 	var data any
 	_ = json.Unmarshal([]byte(`{"rssi":"-67 dBm","rsrp":"-96 dBm","rsrq":"-12 dB","sinr":"8 dB"}`), &data)
