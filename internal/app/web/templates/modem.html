@@ -1,4 +1,4 @@
-{{define "modem.html"}}{{if not .Configured}}<p class="muted">Teltonika not configured.</p>{{else if not .Sample}}<p class="muted">Waiting for first modem poll.</p>{{else}}<div class="dns-path-grid">
+{{define "modem.html"}}{{if .Error}}<p class="alert error">{{.Error}}</p>{{end}}{{if not .Configured}}<p class="muted">Teltonika not configured.</p>{{else if not .Sample}}<p class="muted">Waiting for first modem poll.</p>{{else}}<div class="dns-path-grid">
 <article class="dns-path"><span>RSRP</span><strong>{{.RSRP}}</strong><small>24h {{.MinRSRP}} … {{.MaxRSRP}}</small></article>
 <article class="dns-path"><span>RSRQ</span><strong>{{.RSRQ}}</strong></article>
 <article class="dns-path"><span>SINR</span><strong>{{.SINR}}</strong><small>24h {{.MinSINR}} … {{.MaxSINR}}</small></article>

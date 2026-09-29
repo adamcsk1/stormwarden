@@ -27,6 +27,16 @@ func newBurstLimiter(cooldown time.Duration) *burstLimiter {
 	return &burstLimiter{cooldown: cooldown, now: time.Now}
 }
 
+func (b *burstLimiter) force() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.inFlight {
+		return false
+	}
+	b.inFlight = true
+	return true
+}
+
 func (b *burstLimiter) try() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -45,6 +55,12 @@ func (b *burstLimiter) done() {
 	b.mu.Lock()
 	b.inFlight = false
 	b.last = b.now()
+	b.mu.Unlock()
+}
+
+func (b *burstLimiter) release() {
+	b.mu.Lock()
+	b.inFlight = false
 	b.mu.Unlock()
 }
 
@@ -101,6 +117,10 @@ func (a *App) maybeBurst(ctx context.Context, samples []Sample) []Sample {
 	if !a.cfg.PingEnabled || !isAnomaly(samples) {
 		return nil
 	}
+	if !a.diagMu.TryLock() {
+		return nil
+	}
+	defer a.diagMu.Unlock()
 	if a.burst == nil || !a.burst.try() {
 		return nil
 	}
@@ -166,6 +186,55 @@ func (a *App) shouldTrace(probes, extra []Sample) bool {
 		}
 	}
 	return badTCP >= 2 || upstream
+}
+
+func (a *App) forceDiag(ctx context.Context) []Sample {
+	var extra []Sample
+	if a.cfg.PingEnabled && a.burst != nil && a.burst.force() {
+		extra = append(extra, a.runPingOrdered(ctx)...)
+		a.burst.release()
+	}
+	if ctx.Err() == nil && a.cfg.TracerouteEnabled {
+		extra = append(extra, a.forceTrace(ctx)...)
+	}
+	return extra
+}
+
+func (a *App) runPingOrdered(ctx context.Context) []Sample {
+	ping := a.ping
+	if ping == nil {
+		ping = execPing
+	}
+	var out []Sample
+	for _, t := range a.pingTargets() {
+		if ctx.Err() != nil {
+			break
+		}
+		tctx, cancel := context.WithTimeout(ctx, a.cfg.BurstTimeout)
+		sample := ping(tctx, t.addr, a.cfg.BurstCount, a.cfg.BurstInterval, time.Second)
+		cancel()
+		sample.Target = "icmp:" + t.name
+		out = append(out, sample)
+	}
+	return out
+}
+
+func (a *App) forceTrace(ctx context.Context) []Sample {
+	if a.traceLimit == nil || !a.traceLimit.force() {
+		return nil
+	}
+	defer a.traceLimit.release()
+	trace := a.trace
+	if trace == nil {
+		trace = execTrace
+	}
+	addr := a.cfg.PingInternetAddr
+	if addr == "" {
+		addr = "1.1.1.1"
+	}
+	tctx, cancel := context.WithTimeout(ctx, time.Duration(3*a.cfg.TracerouteMaxHops+5)*time.Second)
+	defer cancel()
+	return []Sample{trace(tctx, addr, a.cfg.TracerouteMaxHops)}
 }
 
 func (a *App) maybeTrace(ctx context.Context) []Sample {

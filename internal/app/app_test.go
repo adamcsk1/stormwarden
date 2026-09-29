@@ -1202,3 +1202,246 @@ func TestClearRecordedDataKeepsSettings(t *testing.T) {
 		t.Fatalf("samples=%d incidents=%d profile=%s", samples, incidents, profile)
 	}
 }
+
+func TestForceSkipsGates(t *testing.T) {
+	a := newTestApp(t)
+	a.cfg.PingEnabled = true
+	a.cfg.TracerouteEnabled = true
+	a.cfg.BurstCount = 1
+	a.cfg.BurstInterval = time.Millisecond
+	a.cfg.BurstTimeout = time.Second
+	a.cfg.PingPiholeAddr = "192.0.2.1"
+	a.cfg.GatewayAddr = "192.0.2.2"
+	a.cfg.ISPHopAddr = ""
+	a.cfg.PingInternetAddr = "192.0.2.3"
+	a.cfg.NICStatsEnabled = false
+	a.burst = newBurstLimiter(time.Hour)
+	a.traceLimit = newBurstLimiter(time.Hour)
+	if !a.burst.try() || !a.traceLimit.try() {
+		t.Fatal("limiter setup")
+	}
+	a.burst.done()
+	a.traceLimit.done()
+	var order []string
+	a.ping = func(ctx context.Context, addr string, count int, interval, perPacket time.Duration) Sample {
+		order = append(order, addr)
+		return Sample{ProbeType: "icmp-burst", Success: true, Message: "ok"}
+	}
+	traced := false
+	a.trace = func(ctx context.Context, addr string, maxHops int) Sample {
+		traced = true
+		return Sample{ProbeType: "trace", Target: addr, Message: "traced"}
+	}
+	extra := a.forceDiag(context.Background())
+	if !traced || len(extra) != 4 || len(order) != 3 || order[0] != "192.0.2.1" || order[1] != "192.0.2.2" || order[2] != "192.0.2.3" {
+		t.Fatalf("order=%v extra=%d traced=%v", order, len(extra), traced)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(bytes.Repeat([]byte("x"), 256*1024))
+	}))
+	defer server.Close()
+	a.cfg.TransferURL = server.URL
+	a.lastTransfer = time.Now()
+	scheduledTransfer := a.lastTransfer
+	if err := setSetting(context.Background(), a.db, "profile", "low"); err != nil {
+		t.Fatal(err)
+	}
+	issue := Sample{ProbeType: "aggregate", Target: "local_dns", Severity: Error, Message: "DNS down"}
+	a.updateIncident(context.Background(), issue)
+	a.updateIncident(context.Background(), issue)
+	a.forceTransfer(context.Background())
+	if state := a.incidentStates["local_dns"]; state == nil || state.healthyCycles != 0 {
+		t.Fatalf("unrelated DNS incident changed after manual transfer: %+v", state)
+	}
+	var n int
+	if err := a.db.QueryRow(`SELECT COUNT(*) FROM samples WHERE probe_type='transfer'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || !a.lastTransfer.Equal(scheduledTransfer) {
+		t.Fatalf("forced transfer count=%d lastTransfer=%v", n, a.lastTransfer)
+	}
+	if err := setSetting(context.Background(), a.db, "profile", "minimal"); err != nil {
+		t.Fatal(err)
+	}
+	a.forceTransfer(context.Background())
+	if err := a.db.QueryRow(`SELECT COUNT(*) FROM samples WHERE probe_type='transfer'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("minimal profile ran transfer count=%d", n)
+	}
+}
+
+func TestForcedAssetsKeepScheduledDeadlines(t *testing.T) {
+	var fixed, busted atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("stormwarden") == "" {
+			fixed.Add(1)
+		} else {
+			busted.Add(1)
+		}
+		_, _ = w.Write([]byte("asset"))
+	}))
+	defer server.Close()
+	a := newTestApp(t)
+	if err := setSetting(context.Background(), a.db, "asset_targets", "Fixed|"+server.URL+"/fixed\nBusted|cache-bust|"+server.URL+"/busted"); err != nil {
+		t.Fatal(err)
+	}
+	next := time.Now().Add(time.Minute)
+	a.nextCacheBustProbe = next
+	last := a.lastAssetProbe
+	a.runAssets(context.Background(), time.Now(), false, true)
+	if fixed.Load() != 0 || busted.Load() != 1 || !a.nextCacheBustProbe.Equal(next) || !a.lastAssetProbe.Equal(last) {
+		t.Fatalf("gated run changed schedule: fixed=%d busted=%d next=%v last=%v", fixed.Load(), busted.Load(), a.nextCacheBustProbe, a.lastAssetProbe)
+	}
+	a.runAssets(context.Background(), time.Now(), true, false)
+	if fixed.Load() != 1 || busted.Load() != 2 || !a.nextCacheBustProbe.Equal(next) || !a.lastAssetProbe.Equal(last) {
+		t.Fatalf("all run changed schedule: fixed=%d busted=%d next=%v last=%v", fixed.Load(), busted.Load(), a.nextCacheBustProbe, a.lastAssetProbe)
+	}
+	a.runAssetProbeCycle(context.Background())
+	if fixed.Load() != 2 || busted.Load() != 2 {
+		t.Fatalf("scheduled cache bust ran early: fixed=%d busted=%d", fixed.Load(), busted.Load())
+	}
+	a.nextCacheBustProbe = time.Now().Add(-time.Second)
+	a.runAssetProbeCycle(context.Background())
+	if fixed.Load() != 3 || busted.Load() != 3 {
+		t.Fatalf("scheduled cache bust missed deadline: fixed=%d busted=%d", fixed.Load(), busted.Load())
+	}
+}
+
+func TestForcedICMPDoesNotPauseProbeCycle(t *testing.T) {
+	a := newTestApp(t)
+	a.cfg.PingEnabled = true
+	a.cfg.TracerouteEnabled = false
+	a.cfg.GatewayAddr = "192.0.2.1"
+	a.cfg.PingPiholeAddr = ""
+	a.cfg.PingInternetAddr = ""
+	started := make(chan struct{})
+	release := make(chan struct{})
+	closed := false
+	defer func() {
+		if !closed {
+			close(release)
+		}
+	}()
+	a.ping = func(ctx context.Context, addr string, count int, interval, perPacket time.Duration) Sample {
+		close(started)
+		<-release
+		return Sample{CreatedAt: time.Now(), ProbeType: "icmp-burst", Severity: Info, Success: true}
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.runForced(context.Background(), "icmp")
+		done <- err
+	}()
+	<-started
+	if !a.probeMu.TryLock() {
+		t.Fatal("manual diagnostics blocked regular probe cycle")
+	}
+	a.probeMu.Unlock()
+	if got := a.maybeBurst(context.Background(), []Sample{tcpSample("test", Error, 4000, false)}); got != nil {
+		t.Fatalf("regular diagnostics overlapped manual run: %v", got)
+	}
+	close(release)
+	closed = true
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("manual ping did not finish")
+	}
+	var n int
+	if err := a.db.QueryRow(`SELECT COUNT(*) FROM samples WHERE probe_type='icmp-burst'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("forced sample count=%d err=%v", n, err)
+	}
+}
+
+func TestForcedTransferDoesNotPauseProbeCycle(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	closed := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		_, _ = w.Write(bytes.Repeat([]byte("x"), 256*1024))
+	}))
+	defer func() {
+		if !closed {
+			close(release)
+		}
+		server.Close()
+	}()
+	a := newTestApp(t)
+	a.cfg.TransferURL = server.URL
+	done := make(chan struct{})
+	go func() {
+		a.forceTransfer(context.Background())
+		close(done)
+	}()
+	<-started
+	if !a.probeMu.TryLock() {
+		t.Fatal("manual transfer blocked regular probe cycle")
+	}
+	a.probeMu.Unlock()
+	if a.transferMu.TryLock() {
+		a.transferMu.Unlock()
+		t.Fatal("regular transfer could overlap manual transfer")
+	}
+	close(release)
+	closed = true
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("manual transfer did not finish")
+	}
+}
+
+func TestCancelledForceRunStopsBeforeNextGroup(t *testing.T) {
+	a := newTestApp(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := a.runForced(ctx, "all"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled run returned %v", err)
+	}
+	var n int
+	if err := a.db.QueryRow(`SELECT COUNT(*) FROM samples`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("canceled run recorded %d samples: %v", n, err)
+	}
+}
+
+func TestForceProbesRequestRequiresCSRFAndRefreshesResults(t *testing.T) {
+	a := newTestApp(t)
+	a.cfg.PingEnabled = true
+	a.cfg.TracerouteEnabled = false
+	a.cfg.GatewayAddr = "192.0.2.1"
+	a.cfg.PingPiholeAddr = ""
+	a.cfg.PingInternetAddr = ""
+	a.ping = func(ctx context.Context, addr string, count int, interval, perPacket time.Duration) Sample {
+		return Sample{CreatedAt: time.Now(), ProbeType: "icmp-burst", Severity: Info, Success: true}
+	}
+	cookie := login(t, a)
+	s, _ := a.sessions.get(cookie.Value)
+	post := func(values url.Values) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, "/ui/force-probes", strings.NewReader(values.Encode()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		r.AddCookie(cookie)
+		result := httptest.NewRecorder()
+		a.Handler().ServeHTTP(result, r)
+		return result
+	}
+	if result := post(url.Values{"mode": {"icmp"}}); result.Code != http.StatusForbidden {
+		t.Fatalf("no CSRF status=%d", result.Code)
+	}
+	result := post(url.Values{"mode": {"icmp"}, "csrf": {s.CSRF}})
+	if result.Code != http.StatusOK || result.Header().Get("HX-Trigger") != "refresh-probes" || !strings.Contains(result.Body.String(), "Enabled diagnostics complete.") {
+		t.Fatalf("manual status=%d trigger=%q body=%s", result.Code, result.Header().Get("HX-Trigger"), result.Body.String())
+	}
+	var n int
+	if err := a.db.QueryRow(`SELECT COUNT(*) FROM samples WHERE probe_type='icmp-burst'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("manual sample count=%d err=%v", n, err)
+	}
+}
