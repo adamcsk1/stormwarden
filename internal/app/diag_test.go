@@ -27,6 +27,28 @@ func TestBurstLimiterCooldown(t *testing.T) {
 	b.done()
 }
 
+func TestForcedBurstKeepsAutomaticCooldown(t *testing.T) {
+	now := time.Now()
+	b := &burstLimiter{cooldown: time.Minute, now: func() time.Time { return now }}
+	if !b.try() {
+		t.Fatal("first burst blocked")
+	}
+	b.done()
+	now = now.Add(30 * time.Second)
+	if !b.force() {
+		t.Fatal("manual burst blocked by cooldown")
+	}
+	b.release()
+	if b.try() {
+		t.Fatal("manual burst cleared automatic cooldown")
+	}
+	now = now.Add(30 * time.Second)
+	if !b.try() {
+		t.Fatal("manual burst delayed automatic burst")
+	}
+	b.done()
+}
+
 func TestBurstLimiterContextCancelDoesNotMatter(t *testing.T) {
 	a := newTestApp(t)
 	a.cfg.PingEnabled = true

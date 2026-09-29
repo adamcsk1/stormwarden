@@ -19,6 +19,9 @@ type App struct {
 	startedAt          time.Time
 	sessions           *sessionStore
 	probeMu            sync.Mutex
+	transferMu         sync.Mutex
+	diagMu             sync.Mutex
+	forceMu            sync.Mutex
 	assetMu            sync.Mutex
 	incidentMu         sync.Mutex
 	dataMu             sync.RWMutex
@@ -302,23 +305,33 @@ func (a *App) runAssetProbeCycle(ctx context.Context) {
 }
 
 func (a *App) runAssetProbeCycleAt(ctx context.Context, cycleAt time.Time) {
+	a.runAssets(ctx, cycleAt, false, false)
+}
+
+func (a *App) runAssets(ctx context.Context, cycleAt time.Time, forceAll, cacheBustOnly bool) error {
 	a.assetMu.Lock()
 	defer a.assetMu.Unlock()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	configured, err := setting(ctx, a.db, "asset_targets")
 	if err != nil {
 		a.logger.Error("asset probe configuration unavailable", "error", err)
-		return
+		return err
 	}
 	targets, err := parseAssetTargets(configured)
 	if err != nil {
 		a.logger.Error("asset probe configuration invalid", "error", err)
-		return
+		return err
 	}
-	cacheBustDue := !cycleAt.Before(a.nextCacheBustProbe)
+	cacheBustDue := forceAll || cacheBustOnly || !cycleAt.Before(a.nextCacheBustProbe)
 	probes := make([]probeFunc, 0, len(targets))
 	categories := make(map[string]string, len(targets))
 	cacheBustIncluded := false
 	for _, target := range targets {
+		if cacheBustOnly && !target.CacheBust {
+			continue
+		}
 		if target.CacheBust && !cacheBustDue {
 			continue
 		}
@@ -327,7 +340,7 @@ func (a *App) runAssetProbeCycleAt(ctx context.Context, cycleAt time.Time) {
 		categories[target.Name] = assetIncidentCategory(target)
 		probes = append(probes, probeFunc{ProbeType: "asset", Target: assetSampleTarget(target), Run: func(probeCtx context.Context) Sample { return probeAsset(probeCtx, target, a.cfg.HTTPDNSAddr) }})
 	}
-	if cacheBustIncluded {
+	if cacheBustIncluded && !forceAll && !cacheBustOnly {
 		a.nextCacheBustProbe = a.nextCacheBustProbe.Add(cacheBustInterval)
 		if !a.nextCacheBustProbe.After(cycleAt) {
 			a.nextCacheBustProbe = cycleAt.Add(cacheBustInterval)
@@ -335,7 +348,7 @@ func (a *App) runAssetProbeCycleAt(ctx context.Context, cycleAt time.Time) {
 	}
 	samples := runConcurrentProbes(ctx, assetProbeTimeout(), probes)
 	if ctx.Err() != nil {
-		return
+		return ctx.Err()
 	}
 	issues := make([]Sample, 0, len(samples))
 	observed := make(map[string]bool, len(samples))
@@ -358,7 +371,10 @@ func (a *App) runAssetProbeCycleAt(ctx context.Context, cycleAt time.Time) {
 		}
 	}
 	a.updateIncidents(ctx, issues, observed)
-	a.lastAssetProbe = time.Now()
+	if !forceAll && !cacheBustOnly {
+		a.lastAssetProbe = time.Now()
+	}
+	return ctx.Err()
 }
 
 func (a *App) scheduler(ctx context.Context) {
@@ -427,10 +443,19 @@ type incidentState struct {
 }
 
 func (a *App) runProbeCycle(ctx context.Context) {
-	if !a.probeMu.TryLock() {
+	a.runProbeCycleForce(ctx, false)
+}
+
+func (a *App) runProbeCycleForce(ctx context.Context, force bool) {
+	if force {
+		a.probeMu.Lock()
+	} else if !a.probeMu.TryLock() {
 		return
 	}
 	defer a.probeMu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
 
 	probes := []probeFunc{
 		{ProbeType: "dns", Target: "pihole", Run: func(probeCtx context.Context) Sample { return probeDNSTCP(probeCtx, "pihole", a.cfg.PiHoleAddr) }},
@@ -456,16 +481,17 @@ func (a *App) runProbeCycle(ctx context.Context) {
 		profile = "low"
 	}
 	interval := profileTransferInterval(profile)
-	if interval > 0 && time.Since(a.lastTransfer) >= interval {
+	if !force && interval > 0 && time.Since(a.lastTransfer) >= interval && a.transferMu.TryLock() {
 		limit := profileTransferBytes(profile)
 		transferCtx, cancel := context.WithTimeout(ctx, transferProbeTimeout(limit))
 		samples = append(samples, probeHTTPStatusResolver(transferCtx, "transfer", transferURL(a.cfg.TransferURL, limit), limit, http.StatusOK, a.cfg.HTTPDNSAddr))
 		cancel()
 		a.lastTransfer = time.Now()
+		a.transferMu.Unlock()
 	}
 
-	if extra := a.maybeBurst(ctx, samples); len(extra) > 0 {
-		samples = append(samples, extra...)
+	if !force {
+		samples = append(samples, a.maybeBurst(ctx, samples)...)
 	}
 	for _, sample := range samples {
 		if err := insertSample(ctx, a.db, sample); err != nil {
@@ -485,6 +511,98 @@ func (a *App) runProbeCycle(ctx context.Context) {
 		a.healthMu.Unlock()
 	}
 	a.updateIncidents(ctx, issues, observed)
+}
+
+func (a *App) runForced(ctx context.Context, mode string) (string, error) {
+	if !a.forceMu.TryLock() {
+		return "", errors.New("Already running.")
+	}
+	defer a.forceMu.Unlock()
+	switch mode {
+	case "all":
+		a.runProbeCycleForce(ctx, true)
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		a.forceTransfer(ctx)
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		a.runForcedDiag(ctx)
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		if err := a.runAssets(ctx, time.Now(), true, false); err != nil {
+			return "", err
+		}
+		return "Ran all probes.", nil
+	case "gated":
+		a.forceTransfer(ctx)
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		if err := a.runAssets(ctx, time.Now(), false, true); err != nil {
+			return "", err
+		}
+		a.runForcedDiag(ctx)
+		return "Ran gated probes.", ctx.Err()
+	case "icmp":
+		a.runForcedDiag(ctx)
+		return "Enabled diagnostics complete.", ctx.Err()
+	default:
+		return "", errors.New("unknown mode")
+	}
+}
+
+func (a *App) runForcedDiag(ctx context.Context) {
+	a.diagMu.Lock()
+	defer a.diagMu.Unlock()
+	if ctx.Err() == nil {
+		a.insertSamples(ctx, a.forceDiag(ctx))
+	}
+}
+
+func (a *App) forceTransfer(ctx context.Context) {
+	a.transferMu.Lock()
+	defer a.transferMu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
+	profile, err := setting(ctx, a.db, "profile")
+	if err != nil {
+		profile = "low"
+	}
+	if profileTransferInterval(profile) == 0 {
+		return
+	}
+	limit := profileTransferBytes(profile)
+	transferCtx, cancel := context.WithTimeout(ctx, transferProbeTimeout(limit))
+	sample := probeHTTPStatusResolver(transferCtx, "transfer", transferURL(a.cfg.TransferURL, limit), limit, http.StatusOK, a.cfg.HTTPDNSAddr)
+	cancel()
+	if ctx.Err() != nil {
+		return
+	}
+	if err := insertSample(ctx, a.db, sample); err != nil {
+		a.logger.Error("sample persistence failed", "error", err)
+	}
+	var issues []Sample
+	observed := map[string]bool{"slow_transfer": true}
+	if pathDegraded(sample) {
+		issues = append(issues, incidentSample(sample, "slow_transfer"))
+	}
+	if probeHealthIssue(sample) {
+		observed["probe_health"] = true
+		issues = appendProbeHealth(issues, sample, "Transfer")
+	}
+	a.updateIncidents(ctx, issues, observed)
+}
+
+func (a *App) insertSamples(ctx context.Context, samples []Sample) {
+	for _, sample := range samples {
+		if err := insertSample(ctx, a.db, sample); err != nil {
+			a.logger.Error("sample persistence failed", "error", err)
+		}
+	}
 }
 
 func (a *App) correlatePiHoleIncident(ctx context.Context, issues []Sample) {

@@ -404,3 +404,34 @@ func TestTeltonikaHealthCheckAndBypassCooldown(t *testing.T) {
 		t.Fatalf("stored health body=%s", settingsResult.Body.String())
 	}
 }
+
+func TestFetchModemBypassesCooldownAndRequiresCSRF(t *testing.T) {
+	var stats atomic.Int32
+	srv := stubTeltonika(t, &stats)
+	a := newTestApp(t)
+	a.cfg.TeltonikaURL, a.cfg.TeltonikaPassword = srv.URL, "Secret1a"
+	a.teltonika = newTeltonikaClient(Config{TeltonikaURL: srv.URL, TeltonikaUser: "u", TeltonikaPassword: "Secret1a", TeltonikaInsecureSkipVerify: true})
+	a.pollModem(context.Background())
+	cookie := login(t, a)
+	bad := httptest.NewRequest(http.MethodPost, "/ui/modem/fetch", nil)
+	bad.AddCookie(cookie)
+	denied := httptest.NewRecorder()
+	a.Handler().ServeHTTP(denied, bad)
+	if denied.Code != http.StatusForbidden || stats.Load() != 1 {
+		t.Fatalf("missing CSRF status=%d fetches=%d", denied.Code, stats.Load())
+	}
+	s, _ := a.sessions.get(cookie.Value)
+	form := url.Values{"csrf": {s.CSRF}}
+	request := httptest.NewRequest(http.MethodPost, "/ui/modem/fetch", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	result := httptest.NewRecorder()
+	a.Handler().ServeHTTP(result, request)
+	if result.Code != http.StatusOK || !strings.Contains(result.Body.String(), "2 samples/24h") || stats.Load() != 2 {
+		t.Fatalf("fetch status=%d fetches=%d body=%s", result.Code, stats.Load(), result.Body.String())
+	}
+	a.pollModem(context.Background())
+	if stats.Load() != 2 {
+		t.Fatalf("regular modem poll ignored cooldown: fetches=%d", stats.Load())
+	}
+}

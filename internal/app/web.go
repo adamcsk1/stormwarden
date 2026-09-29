@@ -158,6 +158,8 @@ func (a *App) routes() http.Handler {
 	mux.Handle("GET /ui/incidents/{id}", a.requireAuth(http.HandlerFunc(a.incidentDetailFragment)))
 	mux.Handle("GET /ui/layers", a.requireAuth(http.HandlerFunc(a.layersFragment)))
 	mux.Handle("GET /ui/modem", a.requireAuth(http.HandlerFunc(a.modemFragment)))
+	mux.Handle("POST /ui/modem/fetch", a.requireAuth(http.HandlerFunc(a.fetchModem)))
+	mux.Handle("POST /ui/force-probes", a.requireAuth(http.HandlerFunc(a.forceProbes)))
 	mux.Handle("GET /ui/compare", a.requireAuth(http.HandlerFunc(a.compareFragment)))
 	mux.Handle("POST /ui/annotations", a.requireAuth(http.HandlerFunc(a.createAnnotation)))
 	mux.Handle("GET /ui/settings", a.requireAuth(http.HandlerFunc(a.settingsFragment)))
@@ -545,8 +547,54 @@ func nullRadio(n sql.NullFloat64, unit string, prec int) string {
 }
 
 func (a *App) modemFragment(w http.ResponseWriter, r *http.Request) {
+	a.writeModem(w, r, "")
+}
+
+func (a *App) fetchModem(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	if err := r.ParseForm(); err != nil || !a.validCSRF(r) {
+		http.Error(w, "invalid request", http.StatusForbidden)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*teltonikaHTTPTimeout+2*time.Second)
+	defer cancel()
+	sample, skipped, err := a.takeModemSample(ctx, true)
+	fetchErr := ""
+	if err != nil {
+		fetchErr = "Fetch failed: " + redactSMTPErr(err, a.cfg.TeltonikaPassword)
+	} else if !skipped {
+		a.updateRadioIncident(ctx, sample)
+	}
+	a.writeModem(w, r, fetchErr)
+}
+
+func (a *App) forceProbes(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	if err := r.ParseForm(); err != nil || !a.validCSRF(r) {
+		http.Error(w, "invalid request", http.StatusForbidden)
+		return
+	}
+	mode := r.FormValue("mode")
+	if mode != "all" && mode != "gated" && mode != "icmp" {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+	msg, err := a.runForced(ctx, mode)
+	style := "muted"
+	if err != nil {
+		msg = err.Error()
+		style = "alert error"
+	}
+	w.Header().Set("HX-Trigger", "refresh-probes")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, `<span class="%s">%s</span>`, style, template.HTMLEscapeString(msg))
+}
+
+func (a *App) writeModem(w http.ResponseWriter, r *http.Request, fetchErr string) {
 	if !a.cfg.teltonikaEnabled() {
-		a.render(w, "modem.html", map[string]any{"Configured": false})
+		a.render(w, "modem.html", map[string]any{"Configured": false, "Error": fetchErr})
 		return
 	}
 	sample, err := latestModemSample(r.Context(), a.db)
@@ -559,7 +607,7 @@ func (a *App) modemFragment(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	view := map[string]any{"Configured": true, "Samples24": stats.Samples}
+	view := map[string]any{"Configured": true, "Samples24": stats.Samples, "Error": fetchErr}
 	if sample != nil {
 		view["Sample"] = sample
 		view["RSSI"] = radioText(sample.RSSI, "dBm", 0)
