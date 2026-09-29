@@ -343,7 +343,7 @@ func (a *App) zipModemSamples(ctx context.Context, tx *sql.Tx, zw *zip.Writer, f
 	if err != nil {
 		return err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT id, created_at, rssi, rsrp, rsrq, sinr, rscp, ecio, ca_count, band, ca_bands, operator, network_type, cell_id, message
+	rows, err := tx.QueryContext(ctx, `SELECT id, created_at, rssi, rsrp, rsrq, sinr, rscp, ecio, ca_count, band, ca_bands, operator, network_type, cell_id, tac, lte_pci, nr_pci, earfcn, nr_arfcn, mcc, mnc, message
 FROM modem_samples WHERE created_at>=? AND created_at<? ORDER BY id`, from, to)
 	if err != nil {
 		return err

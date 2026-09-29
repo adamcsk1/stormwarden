@@ -4,4 +4,12 @@
 <article class="dns-path"><span>SINR</span><strong>{{.SINR}}</strong><small>24h {{.MinSINR}} … {{.MaxSINR}}</small></article>
 <article class="dns-path"><span>RSSI</span><strong>{{.RSSI}}</strong></article>
 </div>
-<p class="muted layer-net">{{if .Grade}}<span class="badge {{.GradeSeverity}}">{{.Grade}}</span> {{end}}{{if .Stale}}<span class="badge warning">stale</span> {{end}}{{if .Sample.NetworkType}}{{.Sample.NetworkType}}{{end}}{{if .Sample.Operator}} · {{.Sample.Operator}}{{end}}{{if .Sample.Band}} · band {{.Sample.Band}}{{end}}{{if gt .Sample.CACount 0}} · CA {{.Sample.CACount}}{{if .Sample.CABands}} ({{.Sample.CABands}}){{end}}{{end}}{{if .Sample.CellID}} · {{.Sample.CellID}}{{end}} · {{localTime .Sample.CreatedAt}} · {{.Samples24}} samples/24h</p>{{end}}{{end}}
+{{if or .Sample.CellID .Sample.TAC .Sample.LTEPCI .Sample.NRPCI .Sample.EARFCN .Sample.NRARFCN .Sample.MCC .Sample.MNC}}<h3>Cell info</h3><div class="dns-path-grid cell-info-grid">
+{{if .Sample.CellID}}<article class="dns-path"><span>Cell ID</span><strong>{{.Sample.CellID}}</strong></article>{{end}}
+{{if .Sample.TAC}}<article class="dns-path"><span>TAC</span><strong>{{.Sample.TAC}}</strong></article>{{end}}
+{{if or .Sample.LTEPCI .Sample.NRPCI}}<article class="dns-path"><span>Physical cell ID</span><strong>{{if .Sample.LTEPCI}}{{.Sample.LTEPCI}}{{else}}—{{end}} / {{if .Sample.NRPCI}}{{.Sample.NRPCI}}{{else}}—{{end}}</strong><small>LTE / 5G NR</small></article>{{end}}
+{{if or .Sample.EARFCN .Sample.NRARFCN}}<article class="dns-path"><span>EARFCN / NR-ARFCN</span><strong>{{if .Sample.EARFCN}}{{.Sample.EARFCN}}{{else}}—{{end}} / {{if .Sample.NRARFCN}}{{.Sample.NRARFCN}}{{else}}—{{end}}</strong><small>LTE / 5G NR</small></article>{{end}}
+{{if .Sample.MCC}}<article class="dns-path"><span>Mobile country code</span><strong>{{.Sample.MCC}}</strong></article>{{end}}
+{{if .Sample.MNC}}<article class="dns-path"><span>Mobile network code</span><strong>{{.Sample.MNC}}</strong></article>{{end}}
+</div>{{end}}
+<p class="muted layer-net">{{if .Grade}}<span class="badge {{.GradeSeverity}}">{{.Grade}}</span> {{end}}{{if .Stale}}<span class="badge warning">stale</span> {{end}}{{if .Sample.NetworkType}}{{.Sample.NetworkType}}{{end}}{{if .Sample.Operator}} · {{.Sample.Operator}}{{end}}{{if .Sample.Band}} · band {{.Sample.Band}}{{end}}{{if gt .Sample.CACount 0}} · CA {{.Sample.CACount}}{{if .Sample.CABands}} ({{.Sample.CABands}}){{end}}{{end}} · {{localTime .Sample.CreatedAt}} · {{.Samples24}} samples/24h</p>{{end}}{{end}}

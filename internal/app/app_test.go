@@ -756,7 +756,7 @@ func TestExportContainsBoundedAIData(t *testing.T) {
 	_ = insertSample(context.Background(), a.db, inside)
 	_ = insertSample(context.Background(), a.db, outside)
 	rsrp := -96.0
-	_ = insertModemSample(context.Background(), a.db, ModemSample{CreatedAt: time.Now(), RSRP: &rsrp, Operator: "Yettel"})
+	_ = insertModemSample(context.Background(), a.db, ModemSample{CreatedAt: time.Now(), RSRP: &rsrp, Operator: "Yettel", CellID: "123456", TAC: "4321", LTEPCI: "315", NRPCI: "218", EARFCN: "1850", NRARFCN: "427010", MCC: "999", MNC: "01"})
 	_ = insertModemSample(context.Background(), a.db, ModemSample{CreatedAt: time.Now().Add(-48 * time.Hour), RSRP: &rsrp, Operator: "Old Carrier"})
 	_, _ = a.db.Exec(`INSERT INTO incidents(started_at, severity, category, summary, evidence) VALUES (?, 'error', 'outage', 'overlapping', '')`, dbTime(time.Now().Add(-48*time.Hour)))
 	job := exportJob{ID: "test-export", RangeName: "day", From: time.Now().Add(-24 * time.Hour), To: time.Now().Add(time.Minute)}
@@ -802,7 +802,7 @@ func TestExportContainsBoundedAIData(t *testing.T) {
 				t.Fatal("modem export ignored time bounds")
 			}
 			var sample map[string]any
-			if err := json.Unmarshal(data, &sample); err != nil || sample["operator"] != "Yettel" || sample["created_at"] == nil || sample["rsrp"] == nil {
+			if err := json.Unmarshal(data, &sample); err != nil || sample["operator"] != "Yettel" || sample["created_at"] == nil || sample["rsrp"] == nil || sample["cell_id"] != "123456" || sample["tac"] != "4321" || sample["lte_pci"] != "315" || sample["nr_pci"] != "218" || sample["earfcn"] != "1850" || sample["nr_arfcn"] != "427010" || sample["mcc"] != "999" || sample["mnc"] != "01" {
 				t.Fatalf("modem export=%s err=%v", data, err)
 			}
 		}
@@ -811,6 +811,44 @@ func TestExportContainsBoundedAIData(t *testing.T) {
 		if !found {
 			t.Errorf("export missing %s", name)
 		}
+	}
+}
+
+func TestModemCellColumnsMigrateExistingSamples(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`CREATE TABLE modem_samples (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, rssi REAL, rsrp REAL, rsrq REAL, sinr REAL,
+		rscp REAL, ecio REAL, ca_count INTEGER NOT NULL DEFAULT 0, band TEXT NOT NULL DEFAULT '',
+		ca_bands TEXT NOT NULL DEFAULT '', operator TEXT NOT NULL DEFAULT '', network_type TEXT NOT NULL DEFAULT '',
+		cell_id TEXT NOT NULL DEFAULT '', message TEXT NOT NULL DEFAULT ''
+	);
+	INSERT INTO modem_samples(created_at, rsrp, cell_id) VALUES (?, -88, 'old-cell')`, dbTime(time.Now()))
+	if closeErr := legacy.Close(); err != nil || closeErr != nil {
+		t.Fatalf("legacy database: create=%v close=%v", err, closeErr)
+	}
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s, err := latestModemSample(context.Background(), db)
+	if err != nil || s == nil || s.CellID != "old-cell" || s.TAC != "" || s.MNC != "" {
+		t.Fatalf("old cell sample lost on migration: %+v err=%v", s, err)
+	}
+	if err := insertModemSample(context.Background(), db, ModemSample{CreatedAt: time.Now(), CellID: "new-cell", TAC: "4321", LTEPCI: "315", NRPCI: "218", EARFCN: "1850", NRARFCN: "427010", MCC: "999", MNC: "01"}); err != nil {
+		t.Fatal(err)
+	}
+	s, err = latestModemSample(context.Background(), db)
+	if err != nil || s == nil || s.CellID != "new-cell" || s.TAC != "4321" || s.LTEPCI != "315" || s.NRPCI != "218" || s.EARFCN != "1850" || s.NRARFCN != "427010" || s.MCC != "999" || s.MNC != "01" {
+		t.Fatalf("new cell sample failed after migration: %+v err=%v", s, err)
+	}
+	history, err := modemSamplesBetween(context.Background(), db, time.Now().Add(-time.Hour), time.Now().Add(time.Hour), 10)
+	if err != nil || len(history) != 2 || history[0].CellID != "old-cell" || history[1].MNC != "01" {
+		t.Fatalf("modem timeline after migration: %+v err=%v", history, err)
 	}
 }
 

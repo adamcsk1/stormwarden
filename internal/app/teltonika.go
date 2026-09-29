@@ -43,6 +43,13 @@ type ModemSample struct {
 	Operator    string    `json:"operator,omitempty"`
 	NetworkType string    `json:"network_type,omitempty"`
 	CellID      string    `json:"cell_id,omitempty"`
+	TAC         string    `json:"tac,omitempty"`
+	LTEPCI      string    `json:"lte_pci,omitempty"`
+	NRPCI       string    `json:"nr_pci,omitempty"`
+	EARFCN      string    `json:"earfcn,omitempty"`
+	NRARFCN     string    `json:"nr_arfcn,omitempty"`
+	MCC         string    `json:"mcc,omitempty"`
+	MNC         string    `json:"mnc,omitempty"`
 	Message     string    `json:"message,omitempty"`
 }
 
@@ -181,26 +188,31 @@ func (c *teltonikaClient) readStats(ctx context.Context) (ModemSample, error) {
 	if err := json.Unmarshal(envelope.Data, &data); err != nil {
 		return ModemSample{}, err
 	}
-	switch items := data.(type) {
-	case []any:
-		var last error
-		for _, item := range items {
-			sample := parseModemStats(item)
-			if sample.hasRadio() {
-				return sample, nil
-			}
-			last = errors.New("teltonika response had no radio metrics")
-		}
-		if last != nil {
-			return ModemSample{}, last
-		}
-	default:
-		sample := parseModemStats(data)
-		if sample.hasRadio() {
-			return sample, nil
-		}
+	if sample, ok := firstRadioSample(data); ok {
+		return sample, nil
 	}
 	return ModemSample{}, errors.New("teltonika response had no radio metrics")
+}
+
+func firstRadioSample(data any) (ModemSample, bool) {
+	switch value := data.(type) {
+	case []any:
+		for _, item := range value {
+			if sample, ok := firstRadioSample(item); ok {
+				return sample, true
+			}
+		}
+	case map[string]any:
+		if success, ok := value["success"].(bool); ok && !success {
+			return ModemSample{}, false
+		}
+		if inner, ok := value["data"]; ok {
+			return firstRadioSample(inner)
+		}
+		sample := parseModemStats(value)
+		return sample, sample.hasRadio()
+	}
+	return ModemSample{}, false
 }
 
 func (c *teltonikaClient) do(ctx context.Context, method, path string, body []byte, auth bool) ([]byte, error) {
@@ -362,12 +374,43 @@ func parseModemStats(v any) ModemSample {
 		Operator:    findString(v, "operator", "oper", "opern"),
 		NetworkType: findString(v, "conntype", "conn_type", "nettype", "network", "mode", "nw"),
 		Band:        findString(v, "band", "lte_band", "nr_band"),
-		CellID:      findString(v, "cell_id", "cellid", "cid"),
+		CellID:      cellField(v, "cell_id", "cellid", "cid"),
+		TAC:         cellField(v, "tac"),
+		MCC:         cellField(v, "mcc"),
+		MNC:         cellField(v, "mnc"),
 	}
-	if s.CellID == "" {
-		if pci := findString(v, "pci"); pci != "" {
-			s.CellID = "pci " + pci
+	walkJSON(v, 0, func(key string, value any, _ int) bool {
+		if !strings.EqualFold(key, "cell_info") {
+			return true
 		}
+		cells, ok := value.([]any)
+		if !ok {
+			return true
+		}
+		for _, cell := range cells {
+			if earfcn := cellField(cell, "earfcn"); earfcn != "" && s.EARFCN == "" {
+				s.EARFCN, s.LTEPCI = earfcn, cellField(cell, "pcid", "pci")
+			}
+			if nrARFCN := cellField(cell, "nr-arfcn", "nr_arfcn"); nrARFCN != "" && s.NRARFCN == "" {
+				s.NRARFCN, s.NRPCI = nrARFCN, cellField(cell, "pcid", "pci")
+			}
+			if s.CellID == "" {
+				s.CellID = cellField(cell, "cellid", "cell_id")
+			}
+			if s.TAC == "" {
+				s.TAC = cellField(cell, "tac")
+			}
+			if s.MCC == "" {
+				s.MCC = cellField(cell, "mcc")
+			}
+			if s.MNC == "" {
+				s.MNC = cellField(cell, "mnc")
+			}
+		}
+		return false
+	})
+	if s.LTEPCI == "" && s.NRPCI == "" && s.NRARFCN == "" {
+		s.LTEPCI = cellField(v, "pcid", "pci")
 	}
 	if n := findFloat(v, "ca_count", "scc_count", "ca"); n != nil && *n >= 1 && *n <= 16 {
 		s.CACount = int(*n)
@@ -381,6 +424,14 @@ func parseModemStats(v any) ModemSample {
 	}
 	s.Message = s.evidenceLine()
 	return s
+}
+
+func cellField(v any, names ...string) string {
+	value := findString(v, names...)
+	if strings.EqualFold(value, "N/A") {
+		return ""
+	}
+	return value
 }
 
 func joinCABands(v any) string {
@@ -450,23 +501,24 @@ func findFloat(v any, names ...string) *float64 {
 }
 
 func findString(v any, names ...string) string {
-	want := map[string]bool{}
-	for _, n := range names {
-		want[strings.ToLower(n)] = true
+	priority := map[string]int{}
+	for index, name := range names {
+		priority[strings.ToLower(name)] = index
 	}
-	bestDepth, found := 99, ""
+	bestDepth, bestPriority, found := 99, len(names), ""
 	walkJSON(v, 0, func(key string, val any, depth int) bool {
-		if !want[strings.ToLower(key)] || depth >= bestDepth {
+		index, ok := priority[strings.ToLower(key)]
+		if !ok || depth > bestDepth || (depth == bestDepth && index >= bestPriority) {
 			return true
 		}
 		switch t := val.(type) {
 		case string:
 			s := strings.TrimSpace(t)
 			if s != "" {
-				found, bestDepth = s, depth
+				found, bestDepth, bestPriority = s, depth, index
 			}
 		case float64:
-			found, bestDepth = strconv.FormatFloat(t, 'f', -1, 64), depth
+			found, bestDepth, bestPriority = strconv.FormatFloat(t, 'f', -1, 64), depth, index
 		}
 		return true
 	})
