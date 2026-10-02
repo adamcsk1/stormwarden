@@ -2,7 +2,7 @@ name: stormwarden
 
 services:
   stormwarden:
-    build: .
+    image: ghcr.io/adamcsk1/stormwarden:latest
     ports:
       - "${APP_PORT:-8080}:8080"
     cap_add:
