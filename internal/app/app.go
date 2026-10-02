@@ -57,6 +57,14 @@ type App struct {
 	lastModemAttempt   time.Time
 	teltonikaHealthMu  sync.RWMutex
 	teltonikaHealth    piHoleHealthStatus
+	simMu              sync.Mutex
+	simState           simFailoverState
+	simStatus          teltonikaSIMStatus
+	simBadCycles       int
+	simTransition      bool
+	simContext         context.Context
+	simCancel          context.CancelFunc
+	simWorkers         sync.WaitGroup
 }
 
 type probeFunc struct {
@@ -213,6 +221,11 @@ func New(cfg Config, logger *slog.Logger) (*App, error) {
 	if cfg.teltonikaEnabled() {
 		a.teltonika = newTeltonikaClient(cfg)
 	}
+	a.simContext, a.simCancel = context.WithCancel(context.Background())
+	if err := a.loadSIMFailoverState(context.Background()); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return a, nil
 }
 
@@ -243,7 +256,15 @@ func initializeAssetSettings(ctx context.Context, db *sql.DB, configuredDefault 
 	return value, nil
 }
 
-func (a *App) Close() error { return a.db.Close() }
+func (a *App) Close() error {
+	a.simMu.Lock()
+	if a.simCancel != nil {
+		a.simCancel()
+	}
+	a.simMu.Unlock()
+	a.simWorkers.Wait()
+	return a.db.Close()
+}
 
 func (a *App) Annotate(note string) error {
 	return insertAnnotation(context.Background(), a.db, note)
@@ -266,12 +287,17 @@ func (a *App) clearRecordedData(ctx context.Context) error {
 }
 
 func (a *App) Start(ctx context.Context) {
+	a.simMu.Lock()
+	a.simCancel()
+	a.simContext, a.simCancel = context.WithCancel(ctx)
+	a.simMu.Unlock()
 	go a.scheduler(ctx)
 	go a.assetScheduler(ctx)
 	go a.maintenance(ctx)
 	go a.exportWorker(ctx)
 	go a.discoverLoop(ctx)
 	go a.modemLoop(ctx)
+	go a.simFailoverLoop(ctx)
 }
 
 func (a *App) assetScheduler(ctx context.Context) {
@@ -511,6 +537,9 @@ func (a *App) runProbeCycleForce(ctx context.Context, force bool) {
 		a.healthMu.Unlock()
 	}
 	a.updateIncidents(ctx, issues, observed)
+	if !force {
+		a.observeSIMFailover(ctx, issues, samples)
+	}
 }
 
 func (a *App) runForced(ctx context.Context, mode string) (string, error) {

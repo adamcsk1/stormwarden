@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -159,6 +160,7 @@ func TestTeltonikaFetchAndReuseSession(t *testing.T) {
 
 func TestLoadConfigTeltonika(t *testing.T) {
 	t.Setenv("APP_PASSWORD", "test-password")
+	t.Setenv("TELTONIKA_SIM_STABILIZATION", "")
 	t.Setenv("TELTONIKA_URL", "https://192.0.2.1")
 	t.Setenv("TELTONIKA_PASSWORD", "")
 	if _, err := LoadConfig(); err == nil {
@@ -167,13 +169,67 @@ func TestLoadConfigTeltonika(t *testing.T) {
 	t.Setenv("TELTONIKA_PASSWORD", "Secret1a")
 	t.Setenv("TELTONIKA_INSECURESKIPVERIFY", "true")
 	cfg, err := LoadConfig()
-	if err != nil || !cfg.teltonikaEnabled() || !cfg.TeltonikaInsecureSkipVerify || cfg.TeltonikaUser != "admin" {
+	if err != nil || !cfg.teltonikaEnabled() || !cfg.TeltonikaInsecureSkipVerify || cfg.TeltonikaUser != "admin" || cfg.TeltonikaSIMStabilization != time.Minute {
 		t.Fatalf("cfg=%+v err=%v", cfg, err)
 	}
+	t.Setenv("TELTONIKA_SIM_STABILIZATION", "bad")
+	if _, err := LoadConfig(); err == nil {
+		t.Fatal("invalid SIM stabilization accepted")
+	}
+	t.Setenv("TELTONIKA_SIM_STABILIZATION", "60s")
 	t.Setenv("TELTONIKA_URL", "http://192.0.2.1")
 	t.Setenv("TELTONIKA_ALLOW_INSECURE_HTTP", "false")
 	if _, err := LoadConfig(); err == nil {
 		t.Fatal("http without opt-in accepted")
+	}
+}
+
+func TestTeltonikaSIMStatusAndActiveSIMWrite(t *testing.T) {
+	var activeSIM atomic.Int32
+	activeSIM.Store(1)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/api/login" && r.Header.Get("Authorization") != "Bearer sim-session" {
+			http.Error(w, `{"success":false}`, http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/api/login":
+			_, _ = w.Write([]byte(`{"success":true,"data":{"token":"sim-session","expires":300}}`))
+		case "/api/modems/status":
+			_, _ = fmt.Fprintf(w, `{"success":true,"data":[{"id":"2-1","active_sim":%d,"data_conn_state":"connected"}]}`, activeSIM.Load())
+		case "/api/sim_cards/config":
+			_, _ = w.Write([]byte(`{"success":true,"data":[{"id":"2-1-1","modem":"2-1","position":"1","primary":"1"},{"id":"2-1-2","modem":"2-1","position":"2","primary":"0"}]}`))
+		case "/api/sim_cards/config/2-1-2":
+			if r.Method != http.MethodPut {
+				http.Error(w, "wrong method", http.StatusMethodNotAllowed)
+				return
+			}
+			var body struct {
+				Data map[string]string `json:"data"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Data["primary"] != "1" || len(body.Data) != 1 {
+				http.Error(w, "unexpected payload", http.StatusBadRequest)
+				return
+			}
+			activeSIM.Store(2)
+			_, _ = w.Write([]byte(`{"success":true,"data":{}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	c := newTeltonikaClient(Config{TeltonikaURL: srv.URL, TeltonikaUser: "u", TeltonikaPassword: "p", TeltonikaInsecureSkipVerify: true})
+	status, err := c.status(context.Background())
+	if err != nil || status.ActiveSIM != "1" || status.ModemID != "2-1" || !simDataConnected(status.DataConnState) {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+	if err := c.setActiveSIM(context.Background(), "2", status.ModemID); err != nil {
+		t.Fatal(err)
+	}
+	status, err = c.status(context.Background())
+	if err != nil || status.ActiveSIM != "2" {
+		t.Fatalf("after switch status=%+v err=%v", status, err)
 	}
 }
 

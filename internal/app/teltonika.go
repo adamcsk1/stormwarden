@@ -92,18 +92,220 @@ func newTeltonikaClient(cfg Config) *teltonikaClient {
 func (c *teltonikaClient) fetch(ctx context.Context) (ModemSample, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err := c.ensureSession(ctx); err != nil {
+	raw, err := c.authedDoLocked(ctx, http.MethodGet, "/api/modems/status", nil)
+	if err != nil {
 		return ModemSample{}, err
 	}
-	sample, err := c.readStats(ctx)
-	if err != nil && isTeltonikaAuthErr(err) {
-		c.session, c.until = "", time.Time{}
-		if loginErr := c.ensureSession(ctx); loginErr != nil {
-			return ModemSample{}, loginErr
-		}
-		sample, err = c.readStats(ctx)
+	return parseModemStatus(raw)
+}
+
+type teltonikaSIMStatus struct {
+	ModemID       string
+	ActiveSIM     string
+	DataConnState string
+}
+
+type teltonikaSIMCard struct {
+	ID       string
+	Position string
+	ModemID  string
+}
+
+func (c *teltonikaClient) status(ctx context.Context) (teltonikaSIMStatus, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	raw, err := c.authedDoLocked(ctx, http.MethodGet, "/api/modems/status", nil)
+	if err != nil {
+		return teltonikaSIMStatus{}, err
 	}
-	return sample, err
+	var envelope struct {
+		Success *bool           `json:"success"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return teltonikaSIMStatus{}, err
+	}
+	if envelope.Success != nil && !*envelope.Success {
+		return teltonikaSIMStatus{}, errors.New("teltonika modem status unavailable")
+	}
+	var data any
+	if err := json.Unmarshal(envelope.Data, &data); err != nil {
+		return teltonikaSIMStatus{}, err
+	}
+	status, ok := firstSIMStatus(data)
+	if !ok {
+		return teltonikaSIMStatus{}, errors.New("teltonika response had no active SIM status")
+	}
+	return status, nil
+}
+
+func firstSIMStatus(value any) (teltonikaSIMStatus, bool) {
+	switch item := value.(type) {
+	case []any:
+		for _, child := range item {
+			if status, ok := firstSIMStatus(child); ok {
+				return status, true
+			}
+		}
+	case map[string]any:
+		if success, ok := item["success"].(bool); ok && !success {
+			return teltonikaSIMStatus{}, false
+		}
+		if data, ok := item["data"]; ok {
+			return firstSIMStatus(data)
+		}
+		if active, ok := item["active_sim"]; ok {
+			status := teltonikaSIMStatus{
+				ActiveSIM:     jsonString(active),
+				DataConnState: jsonString(item["data_conn_state"]),
+				ModemID:       jsonString(item["id"]),
+			}
+			if (status.ActiveSIM == "1" || status.ActiveSIM == "2") && status.ModemID != "" {
+				return status, true
+			}
+		}
+		for _, child := range item {
+			if status, ok := firstSIMStatus(child); ok {
+				return status, true
+			}
+		}
+	}
+	return teltonikaSIMStatus{}, false
+}
+
+func jsonString(value any) string {
+	switch value := value.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case float64:
+		return strconv.FormatFloat(value, 'f', -1, 64)
+	case json.Number:
+		return string(value)
+	default:
+		return ""
+	}
+}
+
+func (c *teltonikaClient) setActiveSIM(ctx context.Context, position, modemID string) error {
+	if (position != "1" && position != "2") || modemID == "" {
+		return errors.New("invalid SIM slot or missing modem ID")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	raw, err := c.authedDoLocked(ctx, http.MethodGet, "/api/sim_cards/config", nil)
+	if err != nil {
+		return err
+	}
+	var envelope struct {
+		Success *bool           `json:"success"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return err
+	}
+	if envelope.Success != nil && !*envelope.Success {
+		return errors.New("teltonika SIM configuration unavailable")
+	}
+	var data any
+	if err := json.Unmarshal(envelope.Data, &data); err != nil {
+		return err
+	}
+	card, ok := findSIMCard(data, position, modemID)
+	if !ok {
+		return fmt.Errorf("teltonika SIM %s not found", position)
+	}
+	body, err := json.Marshal(map[string]any{"data": map[string]string{"primary": "1"}})
+	if err != nil {
+		return err
+	}
+	response, err := c.authedDoLocked(ctx, http.MethodPut, "/api/sim_cards/config/"+url.PathEscape(card.ID), body)
+	if err != nil {
+		return err
+	}
+	var result struct {
+		Success *bool `json:"success"`
+		Errors  []struct {
+			Error string `json:"error"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(response, &result); err != nil {
+		return fmt.Errorf("invalid SIM switch response: %w", err)
+	}
+	if result.Success == nil || !*result.Success {
+		if len(result.Errors) > 0 && result.Errors[0].Error != "" {
+			return fmt.Errorf("teltonika SIM switch: %s", result.Errors[0].Error)
+		}
+		return errors.New("teltonika SIM switch rejected")
+	}
+	return nil
+}
+
+func findSIMCard(value any, position, modemID string) (teltonikaSIMCard, bool) {
+	switch item := value.(type) {
+	case []any:
+		for _, child := range item {
+			if card, ok := findSIMCard(child, position, modemID); ok {
+				return card, true
+			}
+		}
+	case map[string]any:
+		if success, ok := item["success"].(bool); ok && !success {
+			return teltonikaSIMCard{}, false
+		}
+		if data, ok := item["data"]; ok {
+			return findSIMCard(data, position, modemID)
+		}
+		id := jsonString(item["id"])
+		cardPosition := jsonString(item["position"])
+		cardModem := jsonString(item["modem"])
+		if id != "" && cardPosition == position && cardModem == modemID {
+			return teltonikaSIMCard{ID: id, Position: cardPosition, ModemID: cardModem}, true
+		}
+		for _, child := range item {
+			if card, ok := findSIMCard(child, position, modemID); ok {
+				return card, true
+			}
+		}
+	}
+	return teltonikaSIMCard{}, false
+}
+
+func (c *teltonikaClient) authedDoLocked(ctx context.Context, method, path string, body []byte) ([]byte, error) {
+	if err := c.ensureSession(ctx); err != nil {
+		return nil, err
+	}
+	raw, err := c.do(ctx, method, path, body, true)
+	if err == nil {
+		err = teltonikaResponseError(raw)
+	}
+	if err == nil || !isTeltonikaAuthErr(err) {
+		return raw, err
+	}
+	c.session, c.until = "", time.Time{}
+	if err := c.ensureSession(ctx); err != nil {
+		return nil, err
+	}
+	raw, err = c.do(ctx, method, path, body, true)
+	if err == nil {
+		err = teltonikaResponseError(raw)
+	}
+	return raw, err
+}
+
+func teltonikaResponseError(raw []byte) error {
+	var result struct {
+		Success *bool `json:"success"`
+		Errors  []struct {
+			Error string `json:"error"`
+		} `json:"errors"`
+	}
+	if json.Unmarshal(raw, &result) == nil && result.Success != nil && !*result.Success {
+		if len(result.Errors) > 0 {
+			return fmt.Errorf("teltonika api: %s", result.Errors[0].Error)
+		}
+		return errors.New("teltonika API rejected request")
+	}
+	return nil
 }
 
 func (c *teltonikaClient) ensureSession(ctx context.Context) error {
@@ -163,11 +365,7 @@ func isTeltonikaAuthErr(err error) bool {
 	return strings.Contains(msg, "HTTP 401") || strings.Contains(msg, "Access denied") || strings.Contains(msg, "Invalid username")
 }
 
-func (c *teltonikaClient) readStats(ctx context.Context) (ModemSample, error) {
-	raw, err := c.do(ctx, http.MethodGet, "/api/modems/status", nil, true)
-	if err != nil {
-		return ModemSample{}, err
-	}
+func parseModemStatus(raw []byte) (ModemSample, error) {
 	var envelope struct {
 		Success *bool           `json:"success"`
 		Data    json.RawMessage `json:"data"`
@@ -237,7 +435,7 @@ func (c *teltonikaClient) do(ctx context.Context, method, path string, body []by
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("teltonika HTTP %d", resp.StatusCode)
 	}
 	return raw, nil
