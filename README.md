@@ -67,15 +67,15 @@ docker compose up -d --build
 
 Open `http://HOST-IP:8080`.
 
-Rebuild on the NAS after pulling:
+Update on the NAS after pulling:
 
 ```sh
 git pull
-docker compose build
+docker compose pull
 docker compose up -d
 ```
 
-`docker compose up -d --build` does the same in one shot.
+The image is published to GitHub Container Registry after CI passes on `main`.
 
 For HTTPS behind reverse proxy, set `APP_COOKIE_SECURE=true`. Do not expose the UI to the internet.
 
