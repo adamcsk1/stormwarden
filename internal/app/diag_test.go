@@ -61,6 +61,10 @@ func TestBurstLimiterContextCancelDoesNotMatter(t *testing.T) {
 	a.cfg.ISPHopAddr = ""
 	a.cfg.NICStatsEnabled = false
 	a.cfg.TracerouteEnabled = false
+	a.netMu.Lock()
+	a.netInfo = NetInfo{}
+	a.ispHop = ""
+	a.netMu.Unlock()
 	a.burst = newBurstLimiter(time.Minute)
 	calls := 0
 	a.ping = func(ctx context.Context, addr string, count int, interval, perPacket time.Duration) Sample {
