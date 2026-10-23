@@ -165,6 +165,14 @@ Gone → cadence resets after that alert was sent. An unsent alert is kept and s
 
 Optional. Stormwarden polls RutOS Web API (`POST /api/login`, `GET /api/modems/status`) every 5 minutes for RSSI, RSRP, RSRQ, SINR, band, cell, operator, and carrier aggregation. Opening a WAN/DNS incident also fetches once, unless a poll already ran in that 5-minute window. One in-flight request, 5s timeout. Failures are logged and never change probe severity.
 
+### Dual-SIM failover (RUTX50)
+
+Settings → **Teltonika SIM failover** stores primary slot and cooldown in Stormwarden's SQLite settings. Default primary is **Unset**, which disables automatic and manual SIM changes. With SIM1 or SIM2 selected, Stormwarden can fail over only after repeated confirmed internet outage or high-confidence WAN/ISP packet loss with a healthy gateway ICMP burst; local DNS/LAN/router and destination-only failures do not trigger it. Automatic failover requires enabled ping diagnostics and a reachable configured/discovered LAN gateway. Prospective failovers run fresh confirmation probes when the normal diagnostic burst is rate-limited.
+
+After cooldown, Stormwarden selects the configured primary, waits for RutOS to report that SIM active and data-connected, then requires `TELTONIKA_SIM_STABILIZATION` uninterrupted connected time (default `60s`, configurable up to `10m`). Two smoke-test cycles 15 seconds apart follow; each requires at least two distinct public-IP TCP controls to succeed without degraded latency. Hostname, duplicate-IP, and private-IP controls are excluded so local DNS/LAN cannot pass the ISP test. Failed primary checks return to secondary with increasing retry cooldown (2×, capped at 24h or twice configured base cooldown, whichever is greater). Manual controls use the same stabilization gate; manual return clears failover retry state and resumes normal monitoring. Cooldown edits apply to subsequent failover/retry cycles. Shutdown preserves pending transitions for restart recovery.
+
+SIM selection uses RutOS `PUT /api/sim_cards/config/{id}` with `primary=1`, then verifies active SIM and data connection using `/api/modems/status`. This changes RutOS's selected primary while on backup; Stormwarden restores the configured primary during return. No band settings are changed. Grant the API user read access to `/modems/status` and `/sim_cards/config`, plus write access to `/sim_cards/config/*`. Current read-only account cannot switch SIMs. Router firmware must expose these RUTX50 endpoints. Disable conflicting RutOS SIM-switch rules so Stormwarden remains sole failover controller.
+
 Self-signed HTTPS:
 
 ```
@@ -180,7 +188,7 @@ Do not use `admin` / `root`. On the router:
 
 1. **System → Administration → User Settings → System Users**
 2. Add a user, group **`user`**. No SSH.
-3. Edit the **`user`** group:
+3. Keep WebUI access read-only in the **`user`** group:
    - **Hide sensitive information:** on
    - **Write action:** Deny
    - **Read action:** Allow
@@ -191,11 +199,11 @@ Do not use `admin` / `root`. On the router:
 | `status/network` | **Status → Network** (Mobile: RSSI, RSRP, RSRQ, SINR, CA, cell) |
 | `status/overview` | **Status → Overview** (login landing; needed so the user can open WebUI) |
 
-Also allow **API read** for `/modems/*` (or `/modems/status`). Stormwarden uses `GET /api/modems/status`, not WebUI JSON-RPC.
+Also allow **API read** for `/modems/*` (or `/modems/status`). For SIM switching, allow API read on `/sim_cards/config` and API write on `/sim_cards/config/*`. Keep these API permissions narrowly scoped; WebUI write access can remain denied. Stormwarden uses `GET /api/modems/status` and `GET/PUT /api/sim_cards/config`, not WebUI JSON-RPC.
 
 If a path 404s in group settings, open that page as admin and copy the URL starting at `#`. Example: `https://192.168.1.1/#/status/network` → `status/network`.
 
-Default `user` cannot read Network or the modem API. Without `/modems/status` read, the health check returns HTTP 403.
+Default `user` cannot read Network or the modem API. Without `/modems/status` read, the health check returns HTTP 403. SIM failover additionally requires SIM-config write permission; do not grant broad admin access solely for this feature.
 
 ## Probe hierarchy and classification
 

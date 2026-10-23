@@ -159,6 +159,10 @@ func (a *App) routes() http.Handler {
 	mux.Handle("GET /ui/layers", a.requireAuth(http.HandlerFunc(a.layersFragment)))
 	mux.Handle("GET /ui/modem", a.requireAuth(http.HandlerFunc(a.modemFragment)))
 	mux.Handle("POST /ui/modem/fetch", a.requireAuth(http.HandlerFunc(a.fetchModem)))
+	mux.Handle("GET /ui/sim-failover", a.requireAuth(http.HandlerFunc(a.simFailoverFragment)))
+	mux.Handle("GET /ui/sim-failover/status", a.requireAuth(http.HandlerFunc(a.simFailoverStatusFragment)))
+	mux.Handle("POST /ui/sim-failover/settings", a.requireAuth(http.HandlerFunc(a.saveSIMFailoverSettings)))
+	mux.Handle("POST /ui/sim-failover/action", a.requireAuth(http.HandlerFunc(a.simFailoverAction)))
 	mux.Handle("POST /ui/force-probes", a.requireAuth(http.HandlerFunc(a.forceProbes)))
 	mux.Handle("GET /ui/compare", a.requireAuth(http.HandlerFunc(a.compareFragment)))
 	mux.Handle("POST /ui/annotations", a.requireAuth(http.HandlerFunc(a.createAnnotation)))
@@ -675,7 +679,9 @@ func (a *App) settingsFragment(w http.ResponseWriter, r *http.Request) {
 	info := a.netInfo
 	a.netMu.RUnlock()
 	notes, _ := recentAnnotations(r.Context(), a.db, 8)
-	a.render(w, "settings.html", map[string]any{"Profile": profile, "AssetTargets": assetTargets, "CSRF": s.CSRF, "Saved": r.URL.Query().Get("saved") != "", "Cleared": r.URL.Query().Get("cleared") != "", "PiHoleHealth": a.piHoleHealthView(s.CSRF), "TeltonikaHealth": a.teltonikaHealthView(s.CSRF), "SMTPHealth": a.smtpHealthView(s.CSRF), "Net": info, "Annotations": notes})
+	data := map[string]any{"Profile": profile, "AssetTargets": assetTargets, "CSRF": s.CSRF, "Saved": r.URL.Query().Get("saved") != "", "Cleared": r.URL.Query().Get("cleared") != "", "PiHoleHealth": a.piHoleHealthView(s.CSRF), "TeltonikaHealth": a.teltonikaHealthView(s.CSRF), "SMTPHealth": a.smtpHealthView(s.CSRF), "Net": info, "Annotations": notes}
+	data["SIMFailover"] = a.simFailoverView(r.Context(), s.CSRF)
+	a.render(w, "settings.html", data)
 }
 
 func (a *App) clearData(w http.ResponseWriter, r *http.Request) {

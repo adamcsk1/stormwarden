@@ -60,6 +60,7 @@ type Config struct {
 	TeltonikaUser               string
 	TeltonikaPassword           string
 	TeltonikaInsecureSkipVerify bool
+	TeltonikaSIMStabilization   time.Duration
 }
 
 var defaultTCPControls = []TCPControl{
@@ -189,6 +190,10 @@ func LoadConfig() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	teltonikaSIMStabilization, err := envDuration("TELTONIKA_SIM_STABILIZATION", "60s")
+	if err != nil || teltonikaSIMStabilization <= 0 || teltonikaSIMStabilization > 10*time.Minute {
+		return Config{}, errors.New("TELTONIKA_SIM_STABILIZATION must be between 1ns and 10m")
+	}
 	if teltonikaURL != "" {
 		parsed, err := url.Parse(teltonikaURL)
 		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
@@ -243,6 +248,7 @@ func LoadConfig() (Config, error) {
 		TeltonikaUser:               env("TELTONIKA_USER", "admin"),
 		TeltonikaPassword:           teltonikaPassword,
 		TeltonikaInsecureSkipVerify: teltonikaSkipVerify,
+		TeltonikaSIMStabilization:   teltonikaSIMStabilization,
 	}, nil
 }
 

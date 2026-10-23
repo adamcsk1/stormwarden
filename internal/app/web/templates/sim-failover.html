@@ -1,0 +1,43 @@
+{{define "sim-failover.html"}}
+<section id="sim-failover">
+  <h2>Teltonika SIM failover</h2>
+  {{template "sim-failover-status.html" .}}
+  <p class="muted">Connection stabilization: {{.Stabilization}}. Cooldown changes apply to subsequent failover/retry cycles.</p>
+  <form hx-post="/ui/sim-failover/settings" hx-target="#sim-failover" hx-swap="outerHTML">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label>Primary SIM
+      <select name="primary_sim">
+        <option value="unset" {{if eq .PrimarySIM "unset"}}selected{{end}}>Unset · switching disabled</option>
+        <option value="1" {{if eq .PrimarySIM "1"}}selected{{end}}>SIM1</option>
+        <option value="2" {{if eq .PrimarySIM "2"}}selected{{end}}>SIM2</option>
+      </select>
+    </label>
+    <label>Failover cooldown · hours
+      <input type="number" name="sim_cooldown_hours" min="1" max="168" step="1" value="{{.CooldownHours}}">
+    </label>
+    <button type="submit">Save SIM settings</button>
+  </form>
+  {{if not .Configured}}<p class="muted">SIM status and switching require Teltonika API configuration.</p>{{else if not .Enabled}}<p class="muted">Select SIM1 or SIM2 to enable monitoring and switching.</p>{{end}}
+</section>
+{{end}}
+
+{{define "sim-failover-status.html"}}
+<div id="sim-failover-status" hx-get="/ui/sim-failover/status" hx-trigger="every 15s" hx-swap="outerHTML" role="status" aria-live="polite">
+  <p><strong>Status:</strong> {{.ModeLabel}}</p>
+  <p><strong>Primary:</strong> {{if eq .PrimarySIM "unset"}}Unset{{else}}SIM{{.PrimarySIM}}{{end}} · <strong>Active:</strong> {{if .ActiveSIM}}SIM{{.ActiveSIM}}{{else}}unknown{{end}}{{if .DataConnState}} · <strong>Data:</strong> {{.DataConnState}}{{end}}</p>
+  {{if .Message}}<p class="muted">{{.Message}}</p>{{end}}
+  {{if .HasNextTest}}<p class="muted">Next primary test: {{localTime .NextTestAt}}</p>{{end}}
+  {{if .CanSwitchToSecondary}}
+  <form hx-post="/ui/sim-failover/action" hx-target="#sim-failover" hx-swap="outerHTML" hx-confirm="Temporarily switch to SIM{{if eq .PrimarySIM "1"}}2{{else}}1{{end}}?">
+    <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="secondary">
+    <button type="submit">Temporarily use secondary SIM</button>
+  </form>
+  {{end}}
+  {{if .CanSwitchToPrimary}}
+  <form hx-post="/ui/sim-failover/action" hx-target="#sim-failover" hx-swap="outerHTML" hx-confirm="Switch back to primary SIM{{.PrimarySIM}}?">
+    <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="primary">
+    <button type="submit">Return to primary SIM{{.PrimarySIM}}</button>
+  </form>
+  {{end}}
+</div>
+{{end}}
