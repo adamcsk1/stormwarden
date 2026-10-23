@@ -561,7 +561,7 @@ func (a *App) fetchModem(w http.ResponseWriter, r *http.Request) {
 	sample, skipped, err := a.takeModemSample(ctx, true)
 	fetchErr := ""
 	if err != nil {
-		fetchErr = "Fetch failed: " + redactSMTPErr(err, a.cfg.TeltonikaPassword)
+		fetchErr = "Fetch failed: " + teltonikaErrorCategory(err)
 	} else if !skipped {
 		a.updateRadioIncident(ctx, sample)
 	}
@@ -846,7 +846,7 @@ func (a *App) checkTeltonikaHealth(w http.ResponseWriter, r *http.Request) {
 	message, err := a.runTeltonikaHealth(checkCtx)
 	status := piHoleHealthStatus{State: "healthy", Message: message, CheckedAt: time.Now()}
 	if err != nil {
-		status.State, status.Message = "failed", "Teltonika check failed: "+redactSMTPErr(err, a.cfg.TeltonikaPassword)
+		status.State, status.Message = "failed", "Teltonika check failed: "+teltonikaErrorCategory(err)
 	}
 	a.teltonikaHealthMu.Lock()
 	a.teltonikaHealth = status

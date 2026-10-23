@@ -54,13 +54,14 @@ type ModemSample struct {
 }
 
 type teltonikaClient struct {
-	baseURL  string
-	user     string
-	password string
-	http     *http.Client
-	mu       sync.Mutex
-	session  string
-	until    time.Time
+	baseURL          string
+	user             string
+	password         string
+	http             *http.Client
+	mu               sync.Mutex
+	session          string
+	until            time.Time
+	recordDiagnostic func(teltonikaDiagnostic)
 }
 
 func (c Config) teltonikaEnabled() bool {
@@ -215,7 +216,25 @@ func firstRadioSample(data any) (ModemSample, bool) {
 	return ModemSample{}, false
 }
 
-func (c *teltonikaClient) do(ctx context.Context, method, path string, body []byte, auth bool) ([]byte, error) {
+type teltonikaHTTPError int
+
+func (e teltonikaHTTPError) Error() string { return fmt.Sprintf("teltonika HTTP %d", int(e)) }
+
+func (c *teltonikaClient) do(ctx context.Context, method, path string, body []byte, auth bool) (raw []byte, err error) {
+	operation := "stats"
+	if path == "/api/login" {
+		operation = "login"
+	}
+	ctx, finish := traceTeltonika(ctx, operation)
+	status := 0
+	defer func() {
+		d := finish(status, err)
+		if attempt, ok := ctx.Value(teltonikaAttemptKey{}).(*teltonikaAttempt); ok {
+			attempt.records = append(attempt.records, d)
+		} else if c.recordDiagnostic != nil {
+			c.recordDiagnostic(d)
+		}
+	}()
 	var rdr io.Reader
 	if body != nil {
 		rdr = bytes.NewReader(body)
@@ -233,12 +252,13 @@ func (c *teltonikaClient) do(ctx context.Context, method, path string, body []by
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	status = resp.StatusCode
+	raw, err = io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("teltonika HTTP %d", resp.StatusCode)
+		return nil, teltonikaHTTPError(resp.StatusCode)
 	}
 	return raw, nil
 }
@@ -593,7 +613,7 @@ func (a *App) pollModem(ctx context.Context) {
 		return
 	}
 	if err != nil {
-		a.logger.Error("teltonika modem poll failed", "error", redactSMTPErr(err, a.cfg.TeltonikaPassword))
+		a.logger.Error("teltonika modem poll failed", "error", teltonikaErrorCategory(err))
 		return
 	}
 	a.updateRadioIncident(ctx, sample)
@@ -603,12 +623,25 @@ func (a *App) takeModemSample(ctx context.Context, force bool) (ModemSample, boo
 	if a.teltonika == nil {
 		return ModemSample{}, true, nil
 	}
+	lockStart := time.Now()
 	if force {
 		a.modemMu.Lock()
 	} else if !a.modemMu.TryLock() {
 		return ModemSample{}, true, nil
 	}
 	defer a.modemMu.Unlock()
+	trigger := "poll"
+	if force {
+		trigger = "manual"
+	}
+	attempt := &teltonikaAttempt{trigger: trigger, lockWait: time.Since(lockStart)}
+	ctx = context.WithValue(ctx, teltonikaAttemptKey{}, attempt)
+	defer func() {
+		// Persist after fetch so SQLite writes cannot consume the API deadline.
+		for _, d := range attempt.records {
+			a.recordTeltonikaDiagnostic(d)
+		}
+	}()
 	if !force && !a.lastModemAttempt.IsZero() && time.Since(a.lastModemAttempt) < teltonikaPollInterval {
 		return ModemSample{}, true, nil
 	}
@@ -616,6 +649,13 @@ func (a *App) takeModemSample(ctx context.Context, force bool) (ModemSample, boo
 	pollCtx, cancel := context.WithTimeout(ctx, teltonikaHTTPTimeout)
 	defer cancel()
 	sample, err := a.teltonika.fetch(pollCtx)
+	attempt.records = append(attempt.records, teltonikaDiagnostic{
+		CreatedAt: a.lastModemAttempt.UTC(), Operation: "fetch", Trigger: trigger,
+		Stage: "complete", Result: teltonikaErrorCategory(err),
+		ElapsedMS:  float64(time.Since(a.lastModemAttempt)) / float64(time.Millisecond),
+		LockWaitMS: float64(attempt.lockWait) / float64(time.Millisecond),
+		TimeoutMS:  float64(teltonikaHTTPTimeout.Milliseconds()),
+	})
 	if err != nil {
 		return ModemSample{}, false, err
 	}

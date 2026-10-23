@@ -185,6 +185,13 @@ CREATE TABLE IF NOT EXISTS daily_rollups_v2 (
 ); CREATE INDEX IF NOT EXISTS idx_modem_samples_created ON modem_samples(created_at DESC)`); err != nil {
 		return err
 	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS teltonika_diagnostics (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL,
+  record TEXT NOT NULL
+); CREATE INDEX IF NOT EXISTS idx_teltonika_diagnostics_created ON teltonika_diagnostics(created_at)`); err != nil {
+		return err
+	}
 	for _, column := range []string{"tac", "lte_pci", "nr_pci", "earfcn", "nr_arfcn", "mcc", "mnc"} {
 		if err := ensureColumn(db, "modem_samples", column, "TEXT NOT NULL DEFAULT ''"); err != nil {
 			return err
@@ -772,7 +779,7 @@ func clearRecordedData(ctx context.Context, db *sql.DB) error {
 	}
 	defer tx.Rollback()
 	for _, table := range []string{
-		"samples", "incidents", "modem_samples",
+		"samples", "incidents", "modem_samples", "teltonika_diagnostics",
 		"quarter_hour_rollups", "hourly_rollups", "daily_rollups",
 		"quarter_hour_rollups_v2", "hourly_rollups_v2", "daily_rollups_v2",
 	} {
@@ -812,6 +819,9 @@ avg_mbps=((avg_mbps*samples)+(excluded.avg_mbps*excluded.samples))/(samples+excl
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM samples WHERE created_at < ?`, cutoff); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM teltonika_diagnostics WHERE created_at < ?`, cutoff); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM modem_samples WHERE created_at < ?`, cutoff); err != nil {

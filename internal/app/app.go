@@ -212,6 +212,7 @@ func New(cfg Config, logger *slog.Logger) (*App, error) {
 	}
 	if cfg.teltonikaEnabled() {
 		a.teltonika = newTeltonikaClient(cfg)
+		a.teltonika.recordDiagnostic = a.recordTeltonikaDiagnostic
 	}
 	return a, nil
 }

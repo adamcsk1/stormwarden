@@ -165,6 +165,8 @@ Gone → cadence resets after that alert was sent. An unsent alert is kept and s
 
 Optional. Stormwarden polls RutOS Web API (`POST /api/login`, `GET /api/modems/status`) every 5 minutes for RSSI, RSRP, RSRQ, SINR, band, cell, operator, and carrier aggregation. Opening a WAN/DNS incident also fetches once, unless a poll already ran in that 5-minute window. One in-flight request, 5s timeout. Failures are logged and never change probe severity.
 
+Request diagnostics record connection stage, TCP/TLS timing, time to first byte, HTTP status, connection reuse, lock wait, and a safe error category. They appear in console logs and persist in SQLite for 30 days, including across restarts. Manual checks are labeled `manual`; scheduled and incident-triggered checks are labeled `poll`. Diagnostics use allowlisted fields, never credentials, headers, bodies, or raw error text. Exported endpoint settings contain only scheme, hostname/IP, and port. To investigate a failure, run a manual modem check and export that period; old failures cannot be reconstructed.
+
 Self-signed HTTPS:
 
 ```
@@ -244,6 +246,7 @@ Dashboard generates ZIP reports (day, week, month, custom, all). Each report con
 - `measurements.jsonl`: raw probes
 - `incidents.jsonl`: classified problem log with evidence and contradictions
 - `modem-samples.jsonl`: Teltonika radio readings collected during the report period
+- `teltonika-diagnostics.jsonl`: credential-free request timings and fetch outcomes for the report period (a failed request and its failed fetch are separate records)
 - `annotations.json`: manual network-change markers
 - `settings-redacted.json`: diagnostic configuration without secrets
 - `system-info.json`: runtime and discovered network context

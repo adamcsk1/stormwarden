@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -218,6 +219,11 @@ func (a *App) writeExport(ctx context.Context, zw *zip.Writer, from, to time.Tim
 	left, right := periodStats(ctx, a.db, from, to), periodStats(ctx, a.db, prevFrom, from)
 	notes, _ := listAnnotations(ctx, a.db, from, to, 50)
 	summary := buildExportSummary(a.cfg.Timezone, from, to, profile, len(assetTargets), total, availability, warnings, errorCount, criticals, incidentCount, cover, daily, left, right, notes)
+	var diagnosticCount, diagnosticFailures int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(json_extract(record, '$.result') <> 'ok'), 0) FROM teltonika_diagnostics WHERE created_at>=? AND created_at<?`, fromText, toText).Scan(&diagnosticCount, &diagnosticFailures); err != nil {
+		return err
+	}
+	summary += fmt.Sprintf("\n## Teltonika diagnostics\n\n- Records: %d (requests and fetch outcomes)\n- Non-OK records: %d\n- See teltonika-diagnostics.jsonl for connection stages and timing. Diagnostics begin with the instrumented version; older failures cannot be reconstructed.\n", diagnosticCount, diagnosticFailures)
 	if err := zipText(zw, "README.md", "Use summary.md for an overview and the JSONL files for detailed analysis. JSONL contains one JSON object per line. Raw data retains 30 days; rollups preserve older trends.\n"); err != nil {
 		return err
 	}
@@ -231,6 +237,9 @@ func (a *App) writeExport(ctx context.Context, zw *zip.Writer, from, to time.Tim
 		return err
 	}
 	if err := a.zipModemSamples(ctx, tx, zw, fromText, toText); err != nil {
+		return err
+	}
+	if err := zipTeltonikaDiagnostics(ctx, tx, zw, fromText, toText); err != nil {
 		return err
 	}
 	dnsPaths, err := loadDNSPathSummaries(ctx, tx, fromText, toText)
@@ -250,6 +259,10 @@ func (a *App) writeExport(ctx context.Context, zw *zip.Writer, from, to time.Tim
 		return err
 	}
 	settings := map[string]any{"profile": profile, "asset_targets": redactedAssetTargets, "pihole_dns_target": a.cfg.PiHoleAddr, "public_dns_target": a.cfg.PublicDNS, "doh_probe_url": redactURL(a.cfg.DoHURL), "http_dns_target": a.cfg.HTTPDNSAddr, "http_probe_url": redactURL(a.cfg.HTTPURL), "http_expected_status": a.cfg.HTTPExpectedStatus, "transfer_probe_url": redactURL(a.cfg.TransferURL), "tcp_controls": a.cfg.tcpControls(), "gateway_addr": a.cfg.GatewayAddr, "ping_enabled": a.cfg.PingEnabled, "smtp_enabled": a.cfg.smtpEnabled(), "teltonika_enabled": a.cfg.teltonikaEnabled(), "raw_retention_days": 30, "rollup_retention": "indefinite", "export_retention_days": 7}
+	if endpoint, err := url.Parse(a.cfg.TeltonikaURL); err == nil && endpoint.Host != "" {
+		settings["teltonika_endpoint"] = endpoint.Scheme + "://" + endpoint.Host
+	}
+	settings["teltonika_timeout_ms"] = teltonikaHTTPTimeout.Milliseconds()
 	if err := zipJSON(zw, "settings-redacted.json", settings); err != nil {
 		return err
 	}
